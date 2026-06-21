@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/epc-core",
+  "crates/epc-pack",
+  "crates/epc-validate",
+  "crates/epc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+epc-core = { path = "crates/epc-core" }
+epc-pack = { path = "crates/epc-pack" }
+epc-validate = { path = "crates/epc-validate" }

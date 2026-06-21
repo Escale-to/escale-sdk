@@ -1,0 +1,15 @@
+[package]
+name = "epc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "escale-epc"
+path = "src/main.rs"
+
+[dependencies]
+epc-core.workspace = true
+epc-pack.workspace = true
+epc-validate.workspace = true

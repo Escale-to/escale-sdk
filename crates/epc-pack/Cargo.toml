@@ -1,0 +1,10 @@
+[package]
+name = "epc-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+epc-core.workspace = true
+epc-validate.workspace = true
