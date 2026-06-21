@@ -20,3 +20,8 @@ unsafe_code = "forbid"
 epc-core = { path = "crates/epc-core" }
 epc-pack = { path = "crates/epc-pack" }
 epc-validate = { path = "crates/epc-validate" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
