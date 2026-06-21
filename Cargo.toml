@@ -21,6 +21,7 @@ epc-core = { path = "crates/epc-core" }
 epc-pack = { path = "crates/epc-pack" }
 epc-validate = { path = "crates/epc-validate" }
 base64 = "0.22"
+ed25519-dalek = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

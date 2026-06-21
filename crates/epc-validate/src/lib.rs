@@ -18,13 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use epc_core::{
-    expected_file_size_limit, is_expected_core_file, is_expected_hashed_core_file,
+    expected_file_size_limit, is_allowed_regular_file, is_expected_hashed_core_file,
     is_safe_core_path, is_valid_card_id, HashEntry, HashTransform, Hashes, Manifest,
-    CORE_DOMAIN_SEPARATOR, CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0,
-    HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
-    MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE, MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS,
-    MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_ZIP_ENTRIES, MESSAGE_PATH, THUMBNAIL_PATH,
+    SignatureProof, CORE_DOMAIN_SEPARATOR, CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD,
+    EPC_VERSION_1_0, HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH,
+    MARKDOWN_CORE_PROFILE, MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE,
+    MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS, MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE,
+    MAX_ZIP_ENTRIES, MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -138,6 +140,82 @@ pub struct ValidationSummary {
     pub info: usize,
 }
 
+/// Positive proof-check results collected during validation.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofReport {
+    /// Integrity proof status.
+    pub integrity: IntegrityProofReport,
+
+    /// Authenticity signature proof status.
+    pub signature: SignatureProofReport,
+}
+
+/// `proof/hashes.json` verification status.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityProofReport {
+    /// Whether `proof/hashes.json` was present.
+    pub present: bool,
+
+    /// Whether digest and core-digest checks were attempted.
+    pub checked: bool,
+
+    /// Whether the integrity proof is valid.
+    pub valid: bool,
+
+    /// Hash algorithm declared by `proof/hashes.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_algorithm: Option<String>,
+
+    /// Verified core digest when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_digest: Option<String>,
+}
+
+/// `proof/signature.json` verification status.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureProofReport {
+    /// Whether `proof/signature.json` was present.
+    pub present: bool,
+
+    /// Whether signature checks were attempted.
+    pub checked: bool,
+
+    /// Whether the signature proof is valid under its policy.
+    pub valid: bool,
+
+    /// Whether the signature policy was satisfied.
+    pub policy_satisfied: bool,
+
+    /// Policy mode, for example `all` or `any`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_mode: Option<String>,
+
+    /// Signer's asserted display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_display_name: Option<String>,
+
+    /// Signer's asserted role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_role: Option<String>,
+
+    /// Signer's asserted signing time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<String>,
+
+    /// Signatures verified successfully.
+    pub verified_signatures: Vec<VerifiedSignatureReport>,
+}
+
+/// One successfully verified signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedSignatureReport {
+    /// Signature algorithm identifier.
+    pub algorithm: String,
+
+    /// Base64URL JWK thumbprint key identifier.
+    pub key_id: String,
+}
+
 /// Complete structured EPC validation report.
 ///
 /// Reports are serializable and intended to be stable enough for CLI output,
@@ -155,6 +233,9 @@ pub struct ValidationReport {
 
     /// Issue counts by severity.
     pub summary: ValidationSummary,
+
+    /// Positive proof-check results.
+    pub proofs: ProofReport,
 
     /// Ordered list of validation issues.
     pub issues: Vec<ValidationIssue>,
@@ -174,6 +255,7 @@ impl ValidationReport {
             profile: profile.into(),
             epc_version: epc_version.into(),
             summary: ValidationSummary::default(),
+            proofs: ProofReport::default(),
             issues: Vec::new(),
         }
     }
@@ -199,6 +281,7 @@ impl ValidationReport {
     pub fn extend(&mut self, other: ValidationReport) {
         self.profile = other.profile;
         self.epc_version = other.epc_version;
+        self.proofs = other.proofs;
         for issue in other.issues {
             self.push(issue);
         }
@@ -248,7 +331,7 @@ impl CoreDirectoryValidator {
                 IssueSeverity::Error,
                 "EPC_RESOURCE_TOO_MANY_FILES",
                 "Too many files",
-                "The core-format profile allows exactly five regular files.",
+                "The core-format profile allows five required files plus optional proof files.",
             ));
         }
 
@@ -281,7 +364,7 @@ impl CoreDirectoryValidator {
         }
 
         for file in &files {
-            if !is_expected_core_file(file) {
+            if !is_allowed_regular_file(file) {
                 report.push(
                     ValidationIssue::new(
                         IssueSeverity::Error,
@@ -330,12 +413,19 @@ impl CoreDirectoryValidator {
 
         let hashes = read_hashes(&self.root, &mut report);
         if let Some(hashes) = &hashes {
+            report.proofs.integrity.present = true;
+            report.proofs.integrity.hash_algorithm = Some(hashes.hash_algorithm.clone());
+            report.proofs.integrity.core_digest = Some(hashes.core_digest.clone());
             validate_hashes_schema(hashes, &mut report);
         }
 
         if !report.has_fatal() {
             if let (Some(manifest), Some(hashes)) = (manifest.as_ref(), hashes.as_ref()) {
                 validate_integrity(&self.root, manifest, hashes, &mut report);
+                if let Some(signature) = read_signature(&self.root, &mut report) {
+                    report.proofs.signature.present = true;
+                    validate_signature(manifest, hashes, &signature, &mut report);
+                }
             }
         }
 
@@ -422,7 +512,7 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
             IssueSeverity::Error,
             "EPC_RESOURCE_TOO_MANY_ENTRIES",
             "Too many ZIP entries",
-            "The core-format profile allows at most eight ZIP entries.",
+            "The core-format profile allows at most nine ZIP entries.",
         ));
     }
 
@@ -534,7 +624,7 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
             continue;
         }
 
-        if !is_expected_core_file(&normalized_name) {
+        if !is_allowed_regular_file(&normalized_name) {
             report.push(
                 ValidationIssue::new(
                     IssueSeverity::Error,
@@ -622,7 +712,7 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
             IssueSeverity::Error,
             "EPC_RESOURCE_TOO_MANY_FILES",
             "Too many files",
-            "The core-format profile allows exactly five regular files.",
+            "The core-format profile allows five required files plus optional proof files.",
         ));
     }
 
@@ -861,6 +951,42 @@ fn read_hashes(root: &Path, report: &mut ValidationReport) -> Option<Hashes> {
                     format!("proof/hashes.json is not valid JSON: {error}."),
                 )
                 .with_file(HASHES_PATH),
+            );
+            None
+        }
+    }
+}
+
+fn read_signature(root: &Path, report: &mut ValidationReport) -> Option<SignatureProof> {
+    let path = root.join(SIGNATURE_PATH);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Fatal,
+                    "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                    "Cannot read signature proof",
+                    format!("proof/signature.json cannot be read: {error}."),
+                )
+                .with_file(SIGNATURE_PATH),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_slice(&bytes) {
+        Ok(signature) => Some(signature),
+        Err(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                    "Invalid signature JSON",
+                    format!("proof/signature.json is not valid JSON: {error}."),
+                )
+                .with_file(SIGNATURE_PATH),
             );
             None
         }
@@ -1218,6 +1344,9 @@ fn validate_integrity(
     hashes: &Hashes,
     report: &mut ValidationReport,
 ) {
+    report.proofs.integrity.checked = true;
+    let mut valid = true;
+
     for entry in &hashes.entries {
         let path = root.join(&entry.path);
         let digest = match digest_entry(&path, entry.transform) {
@@ -1225,6 +1354,7 @@ fn validate_integrity(
             Err(_) => continue,
         };
         if digest != entry.digest {
+            valid = false;
             report.push(
                 ValidationIssue::new(
                     IssueSeverity::Error,
@@ -1246,6 +1376,7 @@ fn validate_integrity(
     let digest = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
     if digest != hashes.core_digest {
+        valid = false;
         report.push(
             ValidationIssue::new(
                 IssueSeverity::Error,
@@ -1257,6 +1388,227 @@ fn validate_integrity(
             .with_pointer("#/core_digest"),
         );
     }
+
+    report.proofs.integrity.valid = valid;
+}
+
+fn validate_signature(
+    manifest: &Manifest,
+    hashes: &Hashes,
+    proof: &SignatureProof,
+    report: &mut ValidationReport,
+) {
+    report.proofs.signature.checked = true;
+    report.proofs.signature.policy_mode = Some(proof.payload.policy.mode.clone());
+    report.proofs.signature.signer_display_name = Some(proof.payload.signer.display_name.clone());
+    report.proofs.signature.signer_role = Some(proof.payload.signer.role.clone());
+    report.proofs.signature.signed_at = Some(proof.payload.signed_at.clone());
+    let mut valid = true;
+
+    if proof.signature_version != "1" {
+        valid = false;
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_SIGNATURE_UNSUPPORTED_ALGORITHM",
+                "Unsupported signature proof version",
+                "Only signature_version 1 is supported.",
+            )
+            .with_file(SIGNATURE_PATH)
+            .with_pointer("#/signature_version"),
+        );
+    }
+
+    valid &= validate_signature_binding(
+        proof.payload.context == "EPC-SIGNATURE-V1",
+        "#/payload/context",
+        "payload.context must be EPC-SIGNATURE-V1.",
+        report,
+    );
+    valid &= validate_signature_binding(
+        proof.payload.card_id == manifest.id,
+        "#/payload/card_id",
+        "payload.card_id must match manifest.json id.",
+        report,
+    );
+    valid &= validate_signature_binding(
+        proof.payload.epc_version == manifest.epc_version,
+        "#/payload/epc_version",
+        "payload.epc_version must match manifest.json epc_version.",
+        report,
+    );
+    valid &= validate_signature_binding(
+        proof.payload.core_digest == hashes.core_digest,
+        "#/payload/core_digest",
+        "payload.core_digest must match proof/hashes.json core_digest.",
+        report,
+    );
+    valid &= validate_signature_binding(
+        proof.payload.hash_algorithm == hashes.hash_algorithm,
+        "#/payload/hash_algorithm",
+        "payload.hash_algorithm must match proof/hashes.json hash_algorithm.",
+        report,
+    );
+
+    if proof.payload.policy.mode != "all" && proof.payload.policy.mode != "any" {
+        valid = false;
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                "Unsupported signature policy",
+                "payload.policy.mode must be all or any.",
+            )
+            .with_file(SIGNATURE_PATH)
+            .with_pointer("#/payload/policy/mode"),
+        );
+    }
+    if proof.payload.policy.required_keys.is_empty() {
+        valid = false;
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                "Empty signature policy",
+                "payload.policy.required_keys must contain at least one key.",
+            )
+            .with_file(SIGNATURE_PATH)
+            .with_pointer("#/payload/policy/required_keys"),
+        );
+    }
+
+    let signature_input = signature_input(proof);
+    let mut valid_required = 0_usize;
+    for required in &proof.payload.policy.required_keys {
+        if required.algorithm != "Ed25519" {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_SIGNATURE_UNSUPPORTED_ALGORITHM",
+                    "Unsupported signature algorithm",
+                    "Only Ed25519 signatures are supported.",
+                )
+                .with_file(SIGNATURE_PATH),
+            );
+            continue;
+        }
+
+        let matching_signature = proof
+            .signatures
+            .iter()
+            .filter(|signature| {
+                signature.algorithm == required.algorithm && signature.key_id == required.key_id
+            })
+            .find(|signature| verify_ed25519_signature(signature, &signature_input));
+
+        if let Some(signature) = matching_signature {
+            valid_required += 1;
+            report
+                .proofs
+                .signature
+                .verified_signatures
+                .push(VerifiedSignatureReport {
+                    algorithm: signature.algorithm.clone(),
+                    key_id: signature.key_id.clone(),
+                });
+        } else if proof.payload.policy.mode == "all" {
+            valid = false;
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                    "Required signature missing or invalid",
+                    "A required signature is missing, invalid, or does not match its key id.",
+                )
+                .with_file(SIGNATURE_PATH),
+            );
+        }
+    }
+
+    if proof.payload.policy.mode == "any" && valid_required == 0 {
+        valid = false;
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_SIGNATURE_POLICY_NOT_SATISFIED",
+                "Signature policy not satisfied",
+                "At least one required signature must be valid.",
+            )
+            .with_file(SIGNATURE_PATH),
+        );
+    }
+
+    report.proofs.signature.policy_satisfied = match proof.payload.policy.mode.as_str() {
+        "all" => {
+            valid_required == proof.payload.policy.required_keys.len()
+                && !proof.payload.policy.required_keys.is_empty()
+        }
+        "any" => valid_required > 0,
+        _ => false,
+    };
+    report.proofs.signature.valid = valid && report.proofs.signature.policy_satisfied;
+}
+
+fn validate_signature_binding(
+    ok: bool,
+    pointer: &'static str,
+    detail: &'static str,
+    report: &mut ValidationReport,
+) -> bool {
+    if !ok {
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_ANCHOR_BINDING_MISMATCH",
+                "Signature binding mismatch",
+                detail,
+            )
+            .with_file(SIGNATURE_PATH)
+            .with_pointer(pointer),
+        );
+    }
+    ok
+}
+
+fn signature_input(proof: &SignatureProof) -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(SIGNATURE_DOMAIN_SEPARATOR.as_bytes());
+    let payload =
+        serde_json::to_value(&proof.payload).expect("signature payload serialization cannot fail");
+    input.extend_from_slice(canonical_json(&payload).as_bytes());
+    input
+}
+
+fn verify_ed25519_signature(signature: &epc_core::SignatureEntry, input: &[u8]) -> bool {
+    if signature.public_key.kty != "OKP" || signature.public_key.crv != "Ed25519" {
+        return false;
+    }
+
+    let public_key_bytes = match URL_SAFE_NO_PAD.decode(&signature.public_key.x) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let public_key_bytes: [u8; 32] = match public_key_bytes.try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if ed25519_jwk_thumbprint(&signature.public_key.x) != signature.key_id {
+        return false;
+    }
+
+    let value = match URL_SAFE_NO_PAD.decode(&signature.value) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let signature = match Signature::from_slice(&value) {
+        Ok(signature) => signature,
+        Err(_) => return false,
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&public_key_bytes) {
+        Ok(verifying_key) => verifying_key,
+        Err(_) => return false,
+    };
+    verifying_key.verify(input, &signature).is_ok()
 }
 
 fn digest_entry(path: &Path, transform: HashTransform) -> io::Result<String> {
@@ -1269,6 +1621,15 @@ fn digest_entry(path: &Path, transform: HashTransform) -> io::Result<String> {
         }
     };
     Ok(URL_SAFE_NO_PAD.encode(digest_bytes))
+}
+
+fn ed25519_jwk_thumbprint(public_key_x: &str) -> String {
+    let jwk = serde_json::json!({
+        "crv": "Ed25519",
+        "kty": "OKP",
+        "x": public_key_x,
+    });
+    URL_SAFE_NO_PAD.encode(sha256(canonical_json(&jwk).as_bytes()))
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {

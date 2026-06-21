@@ -55,6 +55,9 @@ pub const MESSAGE_PATH: &str = "text/message.md";
 /// Required integrity proof path.
 pub const HASHES_PATH: &str = "proof/hashes.json";
 
+/// Optional authenticity proof path.
+pub const SIGNATURE_PATH: &str = "proof/signature.json";
+
 /// All regular files required by a `core-format` capsule.
 pub const EXPECTED_CORE_FILES: [&str; 5] = [
     MANIFEST_PATH,
@@ -70,6 +73,9 @@ pub const EXPECTED_CORE_FILES: [&str; 5] = [
 pub const EXPECTED_HASHED_CORE_FILES: [&str; 4] =
     [MANIFEST_PATH, COVER_PATH, THUMBNAIL_PATH, MESSAGE_PATH];
 
+/// Optional proof files recognized by the `core-format` profile.
+pub const OPTIONAL_PROOF_FILES: [&str; 1] = [SIGNATURE_PATH];
+
 /// Directory entries tolerated by the ZIP profile.
 ///
 /// Directory entries are not part of the immutable core; they are allowed only
@@ -83,10 +89,10 @@ pub const MAX_ARCHIVE_SIZE: u64 = 32 * 1024 * 1024;
 pub const MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 40 * 1024 * 1024;
 
 /// Maximum number of ZIP entries, including tolerated directory entries.
-pub const MAX_ZIP_ENTRIES: usize = 8;
+pub const MAX_ZIP_ENTRIES: usize = 9;
 
-/// Exact number of regular files required by `core-format`.
-pub const MAX_REGULAR_FILES: usize = 5;
+/// Maximum number of regular files allowed by `core-format`.
+pub const MAX_REGULAR_FILES: usize = 6;
 
 /// Maximum UTF-8 byte length of a normalized capsule path.
 pub const MAX_PATH_BYTES: usize = 128;
@@ -99,6 +105,9 @@ pub const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 
 /// Maximum `proof/hashes.json` size in bytes.
 pub const MAX_HASHES_SIZE: u64 = 64 * 1024;
+
+/// Maximum `proof/signature.json` size in bytes.
+pub const MAX_SIGNATURE_SIZE: u64 = 64 * 1024;
 
 /// Maximum `text/message.md` size in bytes.
 pub const MAX_MESSAGE_SIZE: u64 = 64 * 1024;
@@ -230,6 +239,106 @@ pub enum HashTransform {
     Identity,
 }
 
+/// EPC authenticity proof model stored in `proof/signature.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureProof {
+    /// Signature proof format version.
+    pub signature_version: String,
+
+    /// Canonical payload signed by every signature.
+    pub payload: SignaturePayload,
+
+    /// Signatures over the canonical payload.
+    pub signatures: Vec<SignatureEntry>,
+}
+
+/// Payload covered by EPC signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignaturePayload {
+    /// Signature domain context, expected to be `EPC-SIGNATURE-V1`.
+    pub context: String,
+
+    /// Manifest card identifier.
+    pub card_id: String,
+
+    /// EPC format version.
+    pub epc_version: String,
+
+    /// Bound core digest from `proof/hashes.json`.
+    pub core_digest: String,
+
+    /// Bound hash algorithm from `proof/hashes.json`.
+    pub hash_algorithm: String,
+
+    /// Signer's asserted signing timestamp.
+    pub signed_at: String,
+
+    /// Human-facing signer metadata.
+    pub signer: SignatureSigner,
+
+    /// Signature verification policy.
+    pub policy: SignaturePolicy,
+}
+
+/// Human-facing signer metadata in an EPC signature payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureSigner {
+    /// Display name asserted by the signer.
+    pub display_name: String,
+
+    /// Signer role, for example `author`.
+    pub role: String,
+}
+
+/// Signature policy for an EPC authenticity proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignaturePolicy {
+    /// Policy mode, expected to be `all` or `any`.
+    pub mode: String,
+
+    /// Required signing keys.
+    pub required_keys: Vec<SignatureRequiredKey>,
+}
+
+/// Required signing key descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureRequiredKey {
+    /// Signature algorithm identifier.
+    pub algorithm: String,
+
+    /// Base64URL JWK thumbprint key identifier.
+    pub key_id: String,
+}
+
+/// One signature over an EPC signature payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureEntry {
+    /// Signature algorithm identifier.
+    pub algorithm: String,
+
+    /// Base64URL JWK thumbprint key identifier.
+    pub key_id: String,
+
+    /// Public key used to verify the signature.
+    pub public_key: SignaturePublicKey,
+
+    /// Base64URL signature bytes.
+    pub value: String,
+}
+
+/// JWK-style Ed25519 public key representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignaturePublicKey {
+    /// Key type, expected to be `OKP`.
+    pub kty: String,
+
+    /// Curve, expected to be `Ed25519`.
+    pub crv: String,
+
+    /// Base64URL Ed25519 public key bytes.
+    pub x: String,
+}
+
 /// Returns `true` when a value is a canonical EPC card id.
 ///
 /// The accepted form is `escale:<ULID>` where the ULID is 26 uppercase
@@ -280,6 +389,7 @@ pub fn expected_file_size_limit(path: &str) -> Option<u64> {
         THUMBNAIL_PATH => Some(MAX_THUMBNAIL_SIZE),
         MESSAGE_PATH => Some(MAX_MESSAGE_SIZE),
         HASHES_PATH => Some(MAX_HASHES_SIZE),
+        SIGNATURE_PATH => Some(MAX_SIGNATURE_SIZE),
         _ => None,
     }
 }
@@ -287,6 +397,11 @@ pub fn expected_file_size_limit(path: &str) -> Option<u64> {
 /// Returns `true` when `path` is one of the five required regular files.
 pub fn is_expected_core_file(path: &str) -> bool {
     EXPECTED_CORE_FILES.contains(&path)
+}
+
+/// Returns `true` when `path` is a regular file allowed by `core-format`.
+pub fn is_allowed_regular_file(path: &str) -> bool {
+    is_expected_core_file(path) || OPTIONAL_PROOF_FILES.contains(&path)
 }
 
 /// Returns `true` when `path` must be covered by `proof/hashes.json`.

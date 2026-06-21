@@ -1,0 +1,27 @@
+{
+  "integrity_version": "1",
+  "hash_algorithm": "sha-256",
+  "entries": [
+    {
+      "path": "manifest.json",
+      "transform": "jcs",
+      "digest": "RCTgugKebIEX9L4GEdJhy9_tMfFpynsZD31WJr0P1XM"
+    },
+    {
+      "path": "media/cover.jxl",
+      "transform": "identity",
+      "digest": "t0kra5WW2i4OLD_nv2hQwdPFqNKHd4bL0QSEja3BeRg"
+    },
+    {
+      "path": "media/thumbnail.jxl",
+      "transform": "identity",
+      "digest": "c-wXx4ZiIerUE5Ni4CQkSOoUFZ9zVkyvhl4O5H4WzxI"
+    },
+    {
+      "path": "text/message.md",
+      "transform": "identity",
+      "digest": "nz84GvjQwPpg87XzHJZ3qJmcyh85ZwyLsETVk2I0SOs"
+    }
+  ],
+  "core_digest": "5z4U9K27wXEK5wYQOPgx0QTwRkCYJNCXpVDmO0omgjo"
+}

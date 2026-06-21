@@ -1,0 +1,27 @@
+{
+  "epc_version": "1.0",
+  "profile": "core-format",
+  "type": "postcard",
+  "id": "escale:01KVNRF5R9FA4MTNF9QNETS25C",
+  "created_at": "2026-06-21T18:53:12Z",
+  "sealed_at": "2026-06-21T19:10:25Z",
+  "author": {
+    "display_name": "GeeBe"
+  },
+  "content": {
+    "cover": {
+      "path": "media/cover.jxl",
+      "mime": "image/jxl"
+    },
+    "thumbnail": {
+      "path": "media/thumbnail.jxl",
+      "mime": "image/jxl"
+    },
+    "message": {
+      "path": "text/message.md",
+      "mime": "text/markdown",
+      "markdown_profile": "epc-markdown-core",
+      "markdown_profile_version": "1.0"
+    }
+  }
+}
