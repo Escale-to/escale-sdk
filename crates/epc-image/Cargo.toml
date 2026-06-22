@@ -1,0 +1,15 @@
+[package]
+name = "epc-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+jxl-encode-libjxl = ["dep:png"]
+
+[dependencies]
+epc-core.workspace = true
+jxl-oxide.workspace = true
+png = { workspace = true, optional = true }
+zip.workspace = true

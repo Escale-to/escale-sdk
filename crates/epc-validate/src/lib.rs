@@ -5,7 +5,8 @@
 //! profile metadata, SHA-256 per-file digests, and `core_digest`.
 //!
 //! ZIP-container validation is also supported for real `.epc` archives. JPEG XL
-//! dimension checks are intentionally left to the next implementation layer.
+//! bitstream and dimension checks are performed through the default `jxl`
+//! feature.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,6 +29,8 @@ use epc_core::{
     MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS, MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE,
     MAX_ZIP_ENTRIES, MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
 };
+#[cfg(feature = "jxl")]
+use epc_image::{EpcImageKind, JxlValidationError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -438,6 +441,8 @@ impl CoreDirectoryValidator {
         }
 
         validate_markdown(&self.root, &mut report);
+        #[cfg(feature = "jxl")]
+        validate_jxl_images(&self.root, &files, &mut report);
 
         let hashes = read_hashes(&self.root, &mut report);
         if let Some(hashes) = &hashes {
@@ -1338,6 +1343,93 @@ fn validate_markdown(root: &Path, report: &mut ValidationReport) {
     }
 }
 
+#[cfg(feature = "jxl")]
+fn validate_jxl_images(root: &Path, files: &BTreeSet<String>, report: &mut ValidationReport) {
+    for file in [COVER_PATH, THUMBNAIL_PATH] {
+        if !files.contains(file) {
+            continue;
+        }
+
+        let Some(kind) = EpcImageKind::from_core_path(file) else {
+            continue;
+        };
+
+        match epc_image::validate_jxl_file(root.join(file), kind) {
+            Ok(_) => {}
+            Err(error) => push_jxl_issue(file, error, report),
+        }
+    }
+}
+
+#[cfg(feature = "jxl")]
+fn push_jxl_issue(file: &str, error: JxlValidationError, report: &mut ValidationReport) {
+    match error {
+        JxlValidationError::Io(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Fatal,
+                    "EPC_IMAGE_JXL_UNREADABLE",
+                    "Cannot read JPEG XL image",
+                    format!("The JPEG XL image cannot be read: {error}."),
+                )
+                .with_file(file),
+            );
+        }
+        JxlValidationError::InvalidBitstream(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_IMAGE_JXL_INVALID",
+                    "Invalid JPEG XL image",
+                    format!("The image is not a valid JPEG XL bitstream: {error}."),
+                )
+                .with_file(file),
+            );
+        }
+        JxlValidationError::DimensionsExceeded {
+            width,
+            height,
+            max_dimension,
+        } => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_RESOURCE_IMAGE_DIMENSIONS_EXCEEDED",
+                    "Image dimensions exceeded",
+                    format!(
+                        "The decoded image is {width}x{height}, exceeding the {max_dimension}px per-side core-format limit."
+                    ),
+                )
+                .with_file(file),
+            );
+        }
+        JxlValidationError::PixelsExceeded { pixels, max_pixels } => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_RESOURCE_IMAGE_PIXELS_EXCEEDED",
+                    "Image pixel limit exceeded",
+                    format!(
+                        "The decoded image has {pixels} pixels, exceeding the {max_pixels} pixel core-format limit."
+                    ),
+                )
+                .with_file(file),
+            );
+        }
+        JxlValidationError::DecodeFailed(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_IMAGE_JXL_DECODE_FAILED",
+                    "JPEG XL decode failed",
+                    format!("The JPEG XL image header was parsed but the first frame could not be decoded: {error}."),
+                )
+                .with_file(file),
+            );
+        }
+    }
+}
+
 fn markdown_link_targets(line: &str) -> impl Iterator<Item = &str> {
     line.match_indices("](").filter_map(|(index, _)| {
         let start = index + 2;
@@ -1893,6 +1985,20 @@ mod tests {
             .any(|issue| issue.code == "EPC_INTEGRITY_DIGEST_MISMATCH"));
     }
 
+    #[test]
+    fn rejects_invalid_jxl_content() {
+        let root = TestDir::new();
+        write_minimal_capsule(root.path(), "escale:00000000000000000000000000");
+        fs::write(root.path().join(COVER_PATH), b"not jpeg xl").unwrap();
+
+        let report = validate_core_directory(root.path());
+
+        assert!(!report.is_valid());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "EPC_IMAGE_JXL_INVALID" && issue.file.as_deref() == Some(COVER_PATH)
+        }));
+    }
+
     struct TestDir {
         path: PathBuf,
     }
@@ -1959,8 +2065,7 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(root.join(COVER_PATH), b"fake jxl cover").unwrap();
-        fs::write(root.join(THUMBNAIL_PATH), b"fake jxl thumbnail").unwrap();
+        write_sample_jxl_files(root);
         fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
 
         let entries = epc_core::EXPECTED_HASHED_CORE_FILES
@@ -1994,6 +2099,19 @@ mod tests {
         fs::write(
             root.join(HASHES_PATH),
             serde_json::to_string_pretty(&hashes).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_sample_jxl_files(root: &Path) {
+        fs::write(
+            root.join(COVER_PATH),
+            include_bytes!("../../../testcases/image/cover.jxl"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(THUMBNAIL_PATH),
+            include_bytes!("../../../testcases/image/thumbnail.jxl"),
         )
         .unwrap();
     }

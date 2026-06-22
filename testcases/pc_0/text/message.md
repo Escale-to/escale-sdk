@@ -1,7 +1,7 @@
 Hello World!
 
-I a so **happy** to present you the _very first prototype_ of **Escale Presence Capsule** digital media.
+I am so **happy** to present you the very first prototype of en **Escale Presence Capsule** media.
 
-See you soon...
+See you soon... for new updates
 
 GeeBe

@@ -22,8 +22,8 @@ use epc_core::{
     is_valid_card_id, CreatedLocalTime, HashEntry, HashTransform, Hashes, Manifest, SignatureEntry,
     SignaturePayload, SignaturePolicy, SignatureProof, SignaturePublicKey, SignatureRequiredKey,
     SignatureSigner, CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256,
-    INTEGRITY_VERSION_1, MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MAX_THUMBNAIL_SIZE,
-    MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
+    INTEGRITY_VERSION_1, MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MESSAGE_PATH,
+    SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
 };
 use epc_validate::{validate_core_directory, validate_epc_file, ValidationReport};
 use serde_json::{Map, Value};
@@ -197,8 +197,9 @@ impl From<zip::result::ZipError> for PackError {
 /// This writes a fresh `manifest.json` with a generated `escale:<ULID>` id,
 /// current UTC `created_at`, device-local creation metadata, empty `sealed_at`,
 /// fixed core-format content paths, and a starter `text/message.md`. Existing
-/// media and message files are left untouched. Existing manifests are
-/// overwritten only when `force` is set.
+/// media and message files are left untouched. Existing generated proofs are
+/// removed because they no longer bind to the new manifest. Existing manifests
+/// are overwritten only when `force` is set.
 pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, PackError> {
     let root = request.output_dir;
     fs::create_dir_all(root.join("media"))?;
@@ -224,6 +225,8 @@ pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, Pa
     } else {
         write_new_file(&root.join(MANIFEST_PATH), manifest_bytes.as_bytes())?;
     }
+    remove_file_if_exists(&root.join(HASHES_PATH))?;
+    remove_file_if_exists(&root.join(SIGNATURE_PATH))?;
     write_file_if_missing(&root.join(MESSAGE_PATH), b"")?;
     Ok(root)
 }
@@ -373,7 +376,9 @@ fn seal_manifest_if_needed(root: &Path) -> Result<Manifest, PackError> {
 
 fn read_manifest(root: &Path) -> Result<Manifest, PackError> {
     let bytes = fs::read(root.join(MANIFEST_PATH))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let mut value: Value = serde_json::from_slice(&bytes)?;
+    complete_manifest_defaults(&mut value)?;
+    Ok(serde_json::from_value(value)?)
 }
 
 fn write_manifest(root: &Path, manifest: &Manifest) -> Result<(), PackError> {
@@ -382,6 +387,61 @@ fn write_manifest(root: &Path, manifest: &Manifest) -> Result<(), PackError> {
         serde_json::to_string_pretty(manifest)?,
     )?;
     Ok(())
+}
+
+fn complete_manifest_defaults(value: &mut Value) -> Result<(), PackError> {
+    let Value::Object(object) = value else {
+        return Ok(());
+    };
+
+    insert_missing_string(object, "epc_version", epc_core::EPC_VERSION_1_0);
+    insert_missing_string(object, "profile", epc_core::CORE_PROFILE);
+    insert_missing_string(object, "type", epc_core::EPC_OBJECT_TYPE_POSTCARD);
+    if !object.contains_key("id") {
+        object.insert("id".to_string(), Value::String(generate_card_id()?));
+    }
+    if !object.contains_key("created_at") {
+        object.insert(
+            "created_at".to_string(),
+            Value::String(current_utc_timestamp()?),
+        );
+    }
+    let mut created_local_time = serde_json::to_value(detect_device_created_local_time())?;
+    if let Some(existing_created_local_time) = object.get_mut("created_local_time") {
+        merge_missing(existing_created_local_time, &mut created_local_time);
+    } else {
+        object.insert("created_local_time".to_string(), created_local_time);
+    }
+    insert_missing_string(object, "sealed_at", "");
+
+    let mut content = serde_json::to_value(core_content_manifest())?;
+    if let Some(existing_content) = object.get_mut("content") {
+        merge_missing(existing_content, &mut content);
+    } else {
+        object.insert("content".to_string(), content);
+    }
+
+    Ok(())
+}
+
+fn insert_missing_string(object: &mut Map<String, Value>, key: &str, value: &str) {
+    object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::String(value.to_string()));
+}
+
+fn merge_missing(target: &mut Value, defaults: &mut Value) {
+    let (Value::Object(target), Value::Object(defaults)) = (target, defaults) else {
+        return;
+    };
+
+    for (key, default_value) in defaults {
+        if let Some(target_value) = target.get_mut(key) {
+            merge_missing(target_value, default_value);
+        } else {
+            target.insert(key.clone(), default_value.take());
+        }
+    }
 }
 
 fn core_content_manifest() -> epc_core::Content {
@@ -416,6 +476,14 @@ fn write_file_if_missing(path: &Path, bytes: &[u8]) -> Result<(), PackError> {
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(PackError::Io(error)),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), PackError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(PackError::Io(error)),
     }
 }
@@ -1339,8 +1407,6 @@ fn generate_valid_max_limits(output_file: &Path) -> Result<(), PackError> {
         "escale:00000000000000000000000001",
         MessageKind::Max,
     )?;
-    write_deterministic_bytes(&source.path().join(COVER_PATH), MAX_COVER_SIZE)?;
-    write_deterministic_bytes(&source.path().join(THUMBNAIL_PATH), MAX_THUMBNAIL_SIZE)?;
     write_hashes(source.path())?;
     write_zip_with_entries(
         source.path(),
@@ -1830,8 +1896,7 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
         root.join(MANIFEST_PATH),
         serde_json::to_string_pretty(&manifest)?,
     )?;
-    fs::write(root.join(COVER_PATH), b"fake jxl cover")?;
-    fs::write(root.join(THUMBNAIL_PATH), b"fake jxl thumbnail")?;
+    write_sample_jxl_files(root)?;
     match kind {
         MessageKind::Max => write_max_markdown(&root.join(MESSAGE_PATH))?,
         MessageKind::Minimal | MessageKind::UnsupportedMarkdownProfile => {
@@ -1839,6 +1904,18 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
         }
     }
 
+    Ok(())
+}
+
+fn write_sample_jxl_files(root: &Path) -> io::Result<()> {
+    fs::write(
+        root.join(COVER_PATH),
+        include_bytes!("../../../testcases/image/cover.jxl"),
+    )?;
+    fs::write(
+        root.join(THUMBNAIL_PATH),
+        include_bytes!("../../../testcases/image/thumbnail.jxl"),
+    )?;
     Ok(())
 }
 
@@ -2038,6 +2115,20 @@ mod tests {
     }
 
     #[test]
+    fn create_removes_stale_generated_proofs() {
+        let draft = TestDir::new();
+        fs::create_dir_all(draft.path().join("proof")).unwrap();
+        fs::write(draft.path().join(HASHES_PATH), b"stale hashes").unwrap();
+        fs::write(draft.path().join(SIGNATURE_PATH), b"stale signature").unwrap();
+
+        create_draft_directory(CreateDraftRequest::new(draft.path(), "Bruno")).unwrap();
+
+        assert!(draft.path().join(MANIFEST_PATH).exists());
+        assert!(!draft.path().join(HASHES_PATH).exists());
+        assert!(!draft.path().join(SIGNATURE_PATH).exists());
+    }
+
+    #[test]
     fn create_keeps_existing_message_file() {
         let draft = TestDir::new();
         fs::create_dir_all(draft.path().join("text")).unwrap();
@@ -2126,6 +2217,42 @@ mod tests {
         );
         assert!(validate_epc_file(&first_output).is_valid());
         assert!(validate_epc_file(&second_output).is_valid());
+    }
+
+    #[test]
+    fn pack_completes_missing_generated_manifest_fields() {
+        let source = TestDir::new();
+        let output_dir = TestDir::new();
+        fs::create_dir_all(source.path().join("media")).unwrap();
+        fs::create_dir_all(source.path().join("text")).unwrap();
+        fs::write(
+            source.path().join(MANIFEST_PATH),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "author": {
+                    "display_name": "Bruno"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_sample_jxl_files(source.path()).unwrap();
+        fs::write(source.path().join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
+
+        let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
+        let manifest_after_pack = read_manifest(source.path());
+
+        assert_eq!(manifest_after_pack.epc_version, epc_core::EPC_VERSION_1_0);
+        assert_eq!(manifest_after_pack.profile, epc_core::CORE_PROFILE);
+        assert_eq!(
+            manifest_after_pack.object_type,
+            epc_core::EPC_OBJECT_TYPE_POSTCARD
+        );
+        assert!(is_valid_card_id(&manifest_after_pack.id));
+        assert!(!manifest_after_pack.created_at.is_empty());
+        assert!(!manifest_after_pack.created_local_time.time_zone.is_empty());
+        assert!(!manifest_after_pack.sealed_at.is_empty());
+        assert_eq!(manifest_after_pack.content, core_content_manifest());
+        assert!(validate_epc_file(&output).is_valid());
     }
 
     #[test]
@@ -2398,8 +2525,7 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(root.join(COVER_PATH), b"fake jxl cover").unwrap();
-        fs::write(root.join(THUMBNAIL_PATH), b"fake jxl thumbnail").unwrap();
+        write_sample_jxl_files(root).unwrap();
         fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
     }
 

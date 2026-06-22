@@ -5,7 +5,7 @@
     {
       "path": "manifest.json",
       "transform": "jcs",
-      "digest": "TuY_CZR9IarrBCNsN4k_oWJBjMzHWanhcyWS4n9y3gE"
+      "digest": "y5S2KFW0P1HBMflXpjNVUI4k7Dw1l3QIribRzIt9iM4"
     },
     {
       "path": "media/cover.jxl",
@@ -20,8 +20,8 @@
     {
       "path": "text/message.md",
       "transform": "identity",
-      "digest": "nz84GvjQwPpg87XzHJZ3qJmcyh85ZwyLsETVk2I0SOs"
+      "digest": "GH1BOOJ4hZN_I-FUCfxMglXJEN_DhIL1sp6g-Cy57cc"
     }
   ],
-  "core_digest": "CDhzKbHLgW-Em0bptQSXPexKPgJcX03_bavoOanncRI"
+  "core_digest": "VRQN3bAsCSOWbFfW0KK13DiEYjfUd5oVhJErdF-c9sI"
 }

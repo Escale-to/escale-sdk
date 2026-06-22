@@ -118,6 +118,18 @@ pub const MAX_COVER_SIZE: u64 = 24 * 1024 * 1024;
 /// Maximum `media/thumbnail.jxl` file size in bytes.
 pub const MAX_THUMBNAIL_SIZE: u64 = 1024 * 1024;
 
+/// Maximum decoded cover image pixels.
+pub const MAX_COVER_PIXELS: u64 = 24_000_000;
+
+/// Maximum decoded cover image width or height in pixels.
+pub const MAX_COVER_DIMENSION: u32 = 8192;
+
+/// Maximum decoded thumbnail image pixels.
+pub const MAX_THUMBNAIL_PIXELS: u64 = 1_000_000;
+
+/// Maximum decoded thumbnail image width or height in pixels.
+pub const MAX_THUMBNAIL_DIMENSION: u32 = 2048;
+
 /// Maximum number of Markdown links allowed by `epc-markdown-core`.
 pub const MAX_MARKDOWN_LINKS: usize = 32;
 

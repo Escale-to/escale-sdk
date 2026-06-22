@@ -5,6 +5,7 @@ Reference SDK and command-line tooling for Escale Presence Capsule (EPC).
 ## Crates
 
 - `epc-core`: shared EPC domain types and core rules.
+- `epc-image`: JPEG XL inspection and decoding helpers.
 - `epc-validate`: validation model and reports.
 - `epc-pack`: EPC archive assembly.
 - `epc-cli`: command-line interface.
@@ -46,6 +47,41 @@ cargo run -p epc-cli -- sign --ssh-key <ssh-ed25519-key> <source-dir>
 cargo run -p epc-cli -- pack <source-dir> [output-dir]
 cargo run -p epc-cli -- pack --sign <ssh-ed25519-key> <source-dir> [output-dir]
 cargo run -p epc-cli -- generate-test-vectors ../escale-design/test-vectors/core-format
+```
+
+Image display helpers:
+
+```rust
+let image = epc_image::render_cover_from_epc_rgba8(
+    "card.epc",
+    epc_image::RenderOptions::fit(1024, 1024),
+)?;
+
+assert_eq!(image.pixels.len(), (image.width * image.height * 4) as usize);
+```
+
+Optional JPEG XL encoding:
+
+```sh
+cargo test -p epc-image --features jxl-encode-libjxl
+```
+
+The `jxl-encode-libjxl` feature delegates encoding to the reference `cjxl`
+binary. It can encode supported input files such as JPEG or PNG, and can encode
+RGBA8 by staging a temporary PNG before invoking `cjxl`.
+
+```rust
+let image = epc_image::RgbaImage {
+    width: 2,
+    height: 2,
+    pixels: vec![255; 2 * 2 * 4],
+};
+
+epc_image::encode_rgba8_to_jxl_file(
+    &image,
+    "media/cover.jxl",
+    &epc_image::EncodeOptions::default(),
+)?;
 ```
 
 Capsule creation:
@@ -136,8 +172,8 @@ Encrypted OpenSSH private keys are not supported yet.
 
 If `manifest.json` already exists, `create` refuses to overwrite it. Use
 `create --force` to reset the draft manifest; this regenerates `id` and
-creation metadata, keeps `sealed_at` empty, and leaves existing message/media
-files untouched.
+creation metadata, keeps `sealed_at` empty, removes stale generated proofs, and
+leaves existing message/media files untouched.
 
 Minimal `manifest.json` file:
 

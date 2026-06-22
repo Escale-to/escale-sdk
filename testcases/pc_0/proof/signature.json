@@ -2,11 +2,11 @@
   "signature_version": "1",
   "payload": {
     "context": "EPC-SIGNATURE-V1",
-    "card_id": "escale:01KVNRF5R9FA4MTNF9QNETS25C",
+    "card_id": "escale:01KVQRYENFMVNRJXSB8FS01DNZ",
     "epc_version": "1.0",
-    "core_digest": "CDhzKbHLgW-Em0bptQSXPexKPgJcX03_bavoOanncRI",
+    "core_digest": "VRQN3bAsCSOWbFfW0KK13DiEYjfUd5oVhJErdF-c9sI",
     "hash_algorithm": "sha-256",
-    "signed_at": "2026-06-21T20:16:34Z",
+    "signed_at": "2026-06-22T13:40:05Z",
     "signer": {
       "display_name": "GeeBe",
       "role": "author"
@@ -16,7 +16,7 @@
       "required_keys": [
         {
           "algorithm": "Ed25519",
-          "key_id": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
+          "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4"
         }
       ]
     }
@@ -24,13 +24,13 @@
   "signatures": [
     {
       "algorithm": "Ed25519",
-      "key_id": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+      "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4",
       "public_key": {
         "kty": "OKP",
         "crv": "Ed25519",
-        "x": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"
+        "x": "Bd3l4qJSfzVJLcljsEwgcKokLA3acKMgKHnnS80qR6c"
       },
-      "value": "p7jjDqNOZbc-fr0uIYoehqevS0UKfnTBYdDBCLftVx0x0TqQeXiek63EWVi2sdWNCthmBKCW3w7osjD86ku9Dw"
+      "value": "_Go2c0l_lACMh-P9xJeaxjkVJ5pxrW2PjBKyjZGR-QQNXps7JL9KlmgztKPNp8ZaDfuVbGAsvWoHIAkY68tSAQ"
     }
   ]
 }
