@@ -410,21 +410,44 @@ fn write_file_if_missing(path: &Path, bytes: &[u8]) -> Result<(), PackError> {
 /// Generates the official `core-format` conformance test vector set.
 ///
 /// `output_root` is the `test-vectors/core-format` directory. The function
-/// writes valid archives under `valid/`, invalid archives under `invalid/`, and
-/// expected validation reports under `reports/invalid/`.
+/// writes valid archives under `valid/`, warning archives under `warning/`,
+/// invalid archives under `invalid/`, and expected validation reports under
+/// `reports/warning/` and `reports/invalid/`.
 pub fn generate_core_format_test_vectors(output_root: impl AsRef<Path>) -> Result<(), PackError> {
     let output_root = output_root.as_ref();
     let valid_dir = output_root.join("valid");
+    let warning_dir = output_root.join("warning");
     let invalid_dir = output_root.join("invalid");
+    let warning_reports_dir = output_root.join("reports").join("warning");
     let invalid_reports_dir = output_root.join("reports").join("invalid");
 
     fs::create_dir_all(&valid_dir)?;
+    fs::create_dir_all(&warning_dir)?;
     fs::create_dir_all(&invalid_dir)?;
+    fs::create_dir_all(&warning_reports_dir)?;
     fs::create_dir_all(&invalid_reports_dir)?;
 
     generate_valid_minimal(&valid_dir.join("minimal.epc"))?;
     generate_valid_max_limits(&valid_dir.join("max-limits.epc"))?;
     generate_valid_with_directory_entries(&valid_dir.join("with-directory-entries.epc"))?;
+
+    generate_warning_empty_message(&warning_dir.join("empty-message.epc"))?;
+    write_expected_report(
+        &warning_dir.join("empty-message.epc"),
+        &warning_reports_dir.join("empty-message.json"),
+    )?;
+
+    generate_warning_empty_cover(&warning_dir.join("empty-cover.epc"))?;
+    write_expected_report(
+        &warning_dir.join("empty-cover.epc"),
+        &warning_reports_dir.join("empty-cover.json"),
+    )?;
+
+    generate_warning_empty_thumbnail(&warning_dir.join("empty-thumbnail.epc"))?;
+    write_expected_report(
+        &warning_dir.join("empty-thumbnail.epc"),
+        &warning_reports_dir.join("empty-thumbnail.json"),
+    )?;
 
     generate_invalid_missing_manifest(&invalid_dir.join("missing-manifest.epc"))?;
     write_expected_report(
@@ -436,6 +459,18 @@ pub fn generate_core_format_test_vectors(output_root: impl AsRef<Path>) -> Resul
     write_expected_report(
         &invalid_dir.join("missing-cover.epc"),
         &invalid_reports_dir.join("missing-cover.json"),
+    )?;
+
+    generate_invalid_missing_thumbnail(&invalid_dir.join("missing-thumbnail.epc"))?;
+    write_expected_report(
+        &invalid_dir.join("missing-thumbnail.epc"),
+        &invalid_reports_dir.join("missing-thumbnail.json"),
+    )?;
+
+    generate_invalid_missing_message(&invalid_dir.join("missing-message.epc"))?;
+    write_expected_report(
+        &invalid_dir.join("missing-message.epc"),
+        &invalid_reports_dir.join("missing-message.json"),
     )?;
 
     generate_invalid_unexpected_entry(&invalid_dir.join("unexpected-entry.epc"))?;
@@ -488,6 +523,44 @@ pub fn generate_core_format_test_vectors(output_root: impl AsRef<Path>) -> Resul
         &invalid_reports_dir.join("unsupported-markdown-profile.json"),
     )?;
 
+    generate_invalid_signature_json(&invalid_dir.join("invalid-signature-json.epc"))?;
+    write_expected_report(
+        &invalid_dir.join("invalid-signature-json.epc"),
+        &invalid_reports_dir.join("invalid-signature-json.json"),
+    )?;
+
+    generate_invalid_signature_card_id_mismatch(
+        &invalid_dir.join("signature-card-id-mismatch.epc"),
+    )?;
+    write_expected_report(
+        &invalid_dir.join("signature-card-id-mismatch.epc"),
+        &invalid_reports_dir.join("signature-card-id-mismatch.json"),
+    )?;
+
+    generate_invalid_signature_core_digest_mismatch(
+        &invalid_dir.join("signature-core-digest-mismatch.epc"),
+    )?;
+    write_expected_report(
+        &invalid_dir.join("signature-core-digest-mismatch.epc"),
+        &invalid_reports_dir.join("signature-core-digest-mismatch.json"),
+    )?;
+
+    generate_invalid_signature_required_key_missing(
+        &invalid_dir.join("signature-required-key-missing.epc"),
+    )?;
+    write_expected_report(
+        &invalid_dir.join("signature-required-key-missing.epc"),
+        &invalid_reports_dir.join("signature-required-key-missing.json"),
+    )?;
+
+    generate_invalid_signature_unsupported_algorithm(
+        &invalid_dir.join("signature-unsupported-algorithm.epc"),
+    )?;
+    write_expected_report(
+        &invalid_dir.join("signature-unsupported-algorithm.epc"),
+        &invalid_reports_dir.join("signature-unsupported-algorithm.json"),
+    )?;
+
     Ok(())
 }
 
@@ -517,6 +590,16 @@ fn write_hashes(root: &Path) -> Result<(), PackError> {
     hashes.core_digest = compute_core_digest(&hashes);
     let json = serde_json::to_string_pretty(&hashes)?;
     let path = root.join(HASHES_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn write_signature_proof(root: &Path, proof: SignatureProof) -> Result<(), PackError> {
+    let json = serde_json::to_string_pretty(&proof)?;
+    let path = root.join(SIGNATURE_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -575,6 +658,57 @@ fn signature_proof(
         signer: SignatureSigner {
             display_name: request.signer_display_name.clone(),
             role: request.signer_role.clone(),
+        },
+        policy: SignaturePolicy {
+            mode: "all".to_string(),
+            required_keys: vec![SignatureRequiredKey {
+                algorithm: "Ed25519".to_string(),
+                key_id: key_id.clone(),
+            }],
+        },
+    };
+
+    let mut signature_input = Vec::new();
+    signature_input.extend_from_slice(SIGNATURE_DOMAIN_SEPARATOR.as_bytes());
+    signature_input
+        .extend_from_slice(canonical_json(&signature_payload_value(&payload)).as_bytes());
+    let signature = signing_key.sign(&signature_input);
+
+    Ok(SignatureProof {
+        signature_version: "1".to_string(),
+        payload,
+        signatures: vec![SignatureEntry {
+            algorithm: "Ed25519".to_string(),
+            key_id,
+            public_key: SignaturePublicKey {
+                kty: "OKP".to_string(),
+                crv: "Ed25519".to_string(),
+                x: public_key_x,
+            },
+            value: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }],
+    })
+}
+
+fn deterministic_signature_proof(
+    manifest: &Manifest,
+    hashes: &Hashes,
+) -> Result<SignatureProof, PackError> {
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_x = URL_SAFE_NO_PAD.encode(verifying_key.as_bytes());
+    let key_id = ed25519_jwk_thumbprint(&public_key_x);
+
+    let payload = SignaturePayload {
+        context: "EPC-SIGNATURE-V1".to_string(),
+        card_id: manifest.id.clone(),
+        epc_version: manifest.epc_version.clone(),
+        core_digest: hashes.core_digest.clone(),
+        hash_algorithm: hashes.hash_algorithm.clone(),
+        signed_at: "2026-06-17T10:06:00Z".to_string(),
+        signer: SignatureSigner {
+            display_name: "Bruno".to_string(),
+            role: "author".to_string(),
         },
         policy: SignaturePolicy {
             mode: "all".to_string(),
@@ -1063,6 +1197,23 @@ fn write_zip_with_entries(
     Ok(())
 }
 
+fn write_zip_with_signature(root: &Path, output_file: &Path) -> Result<(), PackError> {
+    write_zip_with_entries(
+        root,
+        output_file,
+        false,
+        &[
+            MANIFEST_PATH,
+            COVER_PATH,
+            THUMBNAIL_PATH,
+            MESSAGE_PATH,
+            HASHES_PATH,
+            SIGNATURE_PATH,
+        ],
+        &[],
+    )
+}
+
 fn generate_valid_minimal(output_file: &Path) -> Result<(), PackError> {
     let source = TempDir::new("epc-vector-minimal");
     write_vector_source(
@@ -1168,6 +1319,40 @@ fn generate_invalid_missing_cover(output_file: &Path) -> Result<(), PackError> {
     )
 }
 
+fn generate_invalid_missing_thumbnail(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-missing-thumbnail");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000B",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    write_zip_with_entries(
+        source.path(),
+        output_file,
+        false,
+        &[MANIFEST_PATH, COVER_PATH, MESSAGE_PATH, HASHES_PATH],
+        &[],
+    )
+}
+
+fn generate_invalid_missing_message(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-missing-message");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000C",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    write_zip_with_entries(
+        source.path(),
+        output_file,
+        false,
+        &[MANIFEST_PATH, COVER_PATH, THUMBNAIL_PATH, HASHES_PATH],
+        &[],
+    )
+}
+
 fn generate_invalid_unexpected_entry(output_file: &Path) -> Result<(), PackError> {
     let source = TempDir::new("epc-vector-unexpected-entry");
     write_vector_source(
@@ -1188,6 +1373,78 @@ fn generate_invalid_unexpected_entry(output_file: &Path) -> Result<(), PackError
             HASHES_PATH,
         ],
         &[("extra.txt", b"unexpected")],
+    )
+}
+
+fn generate_warning_empty_message(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-empty-message");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000D",
+        MessageKind::Minimal,
+    )?;
+    fs::write(source.path().join(MESSAGE_PATH), [])?;
+    write_hashes(source.path())?;
+    write_zip_with_entries(
+        source.path(),
+        output_file,
+        false,
+        &[
+            MANIFEST_PATH,
+            COVER_PATH,
+            THUMBNAIL_PATH,
+            MESSAGE_PATH,
+            HASHES_PATH,
+        ],
+        &[],
+    )
+}
+
+fn generate_warning_empty_cover(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-empty-cover");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000E",
+        MessageKind::Minimal,
+    )?;
+    fs::write(source.path().join(COVER_PATH), [])?;
+    write_hashes(source.path())?;
+    write_zip_with_entries(
+        source.path(),
+        output_file,
+        false,
+        &[
+            MANIFEST_PATH,
+            COVER_PATH,
+            THUMBNAIL_PATH,
+            MESSAGE_PATH,
+            HASHES_PATH,
+        ],
+        &[],
+    )
+}
+
+fn generate_warning_empty_thumbnail(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-empty-thumbnail");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000F",
+        MessageKind::Minimal,
+    )?;
+    fs::write(source.path().join(THUMBNAIL_PATH), [])?;
+    write_hashes(source.path())?;
+    write_zip_with_entries(
+        source.path(),
+        output_file,
+        false,
+        &[
+            MANIFEST_PATH,
+            COVER_PATH,
+            THUMBNAIL_PATH,
+            MESSAGE_PATH,
+            HASHES_PATH,
+        ],
+        &[],
     )
 }
 
@@ -1284,7 +1541,10 @@ fn generate_invalid_too_many_entries(output_file: &Path) -> Result<(), PackError
             MESSAGE_PATH,
             HASHES_PATH,
         ],
-        &[("extra.txt", b"too many entries")],
+        &[
+            ("extra.txt", b"too many entries"),
+            ("extra-2.txt", b"too many entries"),
+        ],
     )
 }
 
@@ -1332,6 +1592,87 @@ fn generate_invalid_unsupported_markdown_profile(output_file: &Path) -> Result<(
         ],
         &[],
     )
+}
+
+fn generate_invalid_signature_json(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-invalid-signature-json");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000G",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    fs::write(source.path().join(SIGNATURE_PATH), b"{not json")?;
+    write_zip_with_signature(source.path(), output_file)
+}
+
+fn generate_invalid_signature_card_id_mismatch(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-signature-card-id-mismatch");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000H",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    let mut manifest = read_manifest(source.path())?;
+    let hashes = read_hashes(source.path())?;
+    manifest.id = "escale:0000000000000000000000000Z".to_string();
+    write_signature_proof(
+        source.path(),
+        deterministic_signature_proof(&manifest, &hashes)?,
+    )?;
+    write_zip_with_signature(source.path(), output_file)
+}
+
+fn generate_invalid_signature_core_digest_mismatch(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-signature-core-digest-mismatch");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000J",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    let manifest = read_manifest(source.path())?;
+    let mut hashes = read_hashes(source.path())?;
+    hashes.core_digest = URL_SAFE_NO_PAD.encode([9_u8; 32]);
+    write_signature_proof(
+        source.path(),
+        deterministic_signature_proof(&manifest, &hashes)?,
+    )?;
+    write_zip_with_signature(source.path(), output_file)
+}
+
+fn generate_invalid_signature_required_key_missing(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-signature-required-key-missing");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000K",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    let manifest = read_manifest(source.path())?;
+    let hashes = read_hashes(source.path())?;
+    let mut proof = deterministic_signature_proof(&manifest, &hashes)?;
+    proof.signatures.clear();
+    write_signature_proof(source.path(), proof)?;
+    write_zip_with_signature(source.path(), output_file)
+}
+
+fn generate_invalid_signature_unsupported_algorithm(output_file: &Path) -> Result<(), PackError> {
+    let source = TempDir::new("epc-vector-signature-unsupported-algorithm");
+    write_vector_source(
+        source.path(),
+        "escale:0000000000000000000000000M",
+        MessageKind::Minimal,
+    )?;
+    write_hashes(source.path())?;
+    let manifest = read_manifest(source.path())?;
+    let hashes = read_hashes(source.path())?;
+    let mut proof = deterministic_signature_proof(&manifest, &hashes)?;
+    proof.payload.policy.required_keys[0].algorithm = "ML-DSA-65".to_string();
+    proof.signatures[0].algorithm = "ML-DSA-65".to_string();
+    write_signature_proof(source.path(), proof)?;
+    write_zip_with_signature(source.path(), output_file)
 }
 
 fn write_expected_report(vector_file: &Path, report_file: &Path) -> Result<(), PackError> {

@@ -301,12 +301,23 @@ impl ValidationReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreDirectoryValidator {
     root: PathBuf,
+    observed_files: BTreeSet<String>,
 }
 
 impl CoreDirectoryValidator {
     /// Creates a validator rooted at an unpacked capsule directory.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            observed_files: BTreeSet::new(),
+        }
+    }
+
+    fn with_observed_files(root: impl Into<PathBuf>, observed_files: BTreeSet<String>) -> Self {
+        Self {
+            root: root.into(),
+            observed_files,
+        }
     }
 
     /// Validates the directory and returns a structured EPC report.
@@ -344,8 +355,14 @@ impl CoreDirectoryValidator {
             ));
         }
 
+        let observed_files = files
+            .iter()
+            .cloned()
+            .chain(self.observed_files.iter().cloned())
+            .collect::<BTreeSet<_>>();
+
         for expected in epc_core::EXPECTED_CORE_FILES {
-            if !files.contains(expected) {
+            if !observed_files.contains(expected) {
                 let (code, title) = match expected {
                     MANIFEST_PATH => ("EPC_MANIFEST_MISSING", "Manifest missing"),
                     HASHES_PATH => ("EPC_INTEGRITY_HASHES_MISSING", "Hashes missing"),
@@ -392,6 +409,17 @@ impl CoreDirectoryValidator {
                                 code,
                                 "File size limit exceeded",
                                 "The file exceeds its core-format size limit.",
+                            )
+                            .with_file(file),
+                        );
+                    }
+                    Ok(metadata) if metadata.len() == 0 && is_warnable_empty_content_file(file) => {
+                        report.push(
+                            ValidationIssue::new(
+                                IssueSeverity::Warning,
+                                "EPC_CONTENT_EMPTY_FILE",
+                                "Empty content file",
+                                "The file is present but empty.",
                             )
                             .with_file(file),
                         );
@@ -518,6 +546,7 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
 
     let temp_dir = TempDir::new("epc-validate");
     let mut seen = BTreeSet::new();
+    let mut observed_files = BTreeSet::new();
     let mut regular_files = 0_usize;
     let mut total_uncompressed = 0_u64;
 
@@ -637,6 +666,8 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
             continue;
         }
 
+        observed_files.insert(normalized_name.clone());
+
         if let Some(limit) = expected_file_size_limit(&normalized_name) {
             if file.size() > limit {
                 report.push(
@@ -725,7 +756,8 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
         ));
     }
 
-    let content_report = validate_core_directory(temp_dir.path());
+    let content_report =
+        CoreDirectoryValidator::with_observed_files(temp_dir.path(), observed_files).validate();
     report.extend(content_report);
     report
 }
@@ -738,6 +770,10 @@ fn file_size_issue_code(path: &str) -> &'static str {
     } else {
         "EPC_RESOURCE_IMAGE_FILE_TOO_LARGE"
     }
+}
+
+fn is_warnable_empty_content_file(path: &str) -> bool {
+    matches!(path, COVER_PATH | THUMBNAIL_PATH | MESSAGE_PATH)
 }
 
 fn is_zip_symlink(unix_mode: Option<u32>) -> bool {
@@ -1075,26 +1111,43 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         "#/content/message",
         report,
     );
-    expect_eq(
+    expect_markdown_eq(
         &manifest.content.message.markdown_profile,
         MARKDOWN_CORE_PROFILE,
-        "EPC_TEXT_MARKDOWN_PROFILE_UNSUPPORTED",
         "Unsupported Markdown profile",
-        "The core-format profile requires epc-markdown-core.",
-        MANIFEST_PATH,
         "#/content/message/markdown_profile",
         report,
     );
-    expect_eq(
+    expect_markdown_eq(
         &manifest.content.message.markdown_profile_version,
         MARKDOWN_CORE_PROFILE_VERSION,
-        "EPC_TEXT_MARKDOWN_PROFILE_UNSUPPORTED",
         "Unsupported Markdown profile version",
-        "The core-format profile requires epc-markdown-core 1.0.",
-        MANIFEST_PATH,
         "#/content/message/markdown_profile_version",
         report,
     );
+}
+
+fn expect_markdown_eq(
+    actual: &str,
+    expected: &str,
+    title: &str,
+    pointer: &str,
+    report: &mut ValidationReport,
+) {
+    if actual != expected {
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_TEXT_MARKDOWN_PROFILE_UNSUPPORTED",
+                title,
+                format!(
+                    "The core-format profile requires {pointer} to be {expected:?}, but found {actual:?}."
+                ),
+            )
+            .with_file(MANIFEST_PATH)
+            .with_pointer(pointer),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1732,6 +1785,32 @@ mod tests {
 
         let _ = fs::remove_file(&archive);
         assert!(report.is_valid(), "{report:#?}");
+    }
+
+    #[test]
+    fn rejects_too_large_zip_file_without_reporting_it_missing() {
+        let root = TestDir::new();
+        write_minimal_capsule(root.path(), "escale:00000000000000000000000000");
+        fs::write(
+            root.path().join(COVER_PATH),
+            vec![0_u8; (epc_core::MAX_COVER_SIZE + 1) as usize],
+        )
+        .unwrap();
+        let archive = std::env::temp_dir().join("epc-validate-too-large-cover.epc");
+        let _ = fs::remove_file(&archive);
+        write_zip_capsule(root.path(), &archive);
+
+        let report = validate_epc_file(&archive);
+
+        let _ = fs::remove_file(&archive);
+        assert!(!report.is_valid());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "EPC_RESOURCE_IMAGE_FILE_TOO_LARGE"
+                && issue.file.as_deref() == Some(COVER_PATH)
+        }));
+        assert!(!report.issues.iter().any(|issue| {
+            issue.code == "EPC_CONTENT_MISSING_FILE" && issue.file.as_deref() == Some(COVER_PATH)
+        }));
     }
 
     #[test]
