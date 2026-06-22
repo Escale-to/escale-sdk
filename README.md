@@ -88,12 +88,22 @@ sealed capsule filename is generated from ADR-003:
 `TIME6` is derived from `sealed_at`; `ID10` is the last 10 characters of the
 canonical `escale:<ULID>` id.
 
-When using `create`, `id` and `created_at` are generated and `sealed_at` is left
-empty. When using `pack`, `created_at` is kept as the draft/card creation time.
-If `sealed_at` is empty, it is written by the packer at sealing time, before
-`proof/hashes.json` and the filename are generated. If `sealed_at` is already
-present, `pack` keeps it unchanged so repeated packs produce the same ADR-003
-filename. `pack` refuses to overwrite an existing `.epc` archive.
+When using `create`, `id`, `created_at`, and `created_local_time` are generated
+and `sealed_at` is left empty. `created_at` is the canonical UTC creation
+instant. `created_local_time` records the creating device's local time context at
+that same instant: `time_zone` should be the device time zone identifier
+reported by the OS, preferably IANA form such as `Europe/Paris`, and
+`utc_offset` is the device's effective offset at creation time. Mobile and
+embedded SDK integrations should supply this value from the device API when
+building the `CreateDraftRequest`; the reference CLI uses best-effort host
+detection.
+
+When using `pack`, `created_at` and `created_local_time` are kept as the
+draft/card creation metadata. If `sealed_at` is empty, it is written by the
+packer at sealing time, before `proof/hashes.json` and the filename are
+generated. If `sealed_at` is already present, `pack` keeps it unchanged so
+repeated packs produce the same ADR-003 filename. `pack` refuses to overwrite an
+existing `.epc` archive.
 
 Authenticity is added with `sign`, which writes `proof/signature.json`:
 
@@ -126,8 +136,8 @@ Encrypted OpenSSH private keys are not supported yet.
 
 If `manifest.json` already exists, `create` refuses to overwrite it. Use
 `create --force` to reset the draft manifest; this regenerates `id` and
-`created_at`, keeps `sealed_at` empty, and leaves existing message/media files
-untouched.
+creation metadata, keeps `sealed_at` empty, and leaves existing message/media
+files untouched.
 
 Minimal `manifest.json` file:
 
@@ -138,6 +148,10 @@ Minimal `manifest.json` file:
   "type": "postcard",
   "id": "escale:01J0Y3J7Q9M8W2N6K4R5T8X9AZ",
   "created_at": "2026-06-17T10:00:00Z",
+  "created_local_time": {
+    "time_zone": "Europe/Paris",
+    "utc_offset": "+02:00"
+  },
   "sealed_at": "",
   "author": {
     "display_name": "Bruno"

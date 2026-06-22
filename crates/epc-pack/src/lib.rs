@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,11 +19,11 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use epc_core::{
-    is_valid_card_id, HashEntry, HashTransform, Hashes, Manifest, SignatureEntry, SignaturePayload,
-    SignaturePolicy, SignatureProof, SignaturePublicKey, SignatureRequiredKey, SignatureSigner,
-    CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1,
-    MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MAX_THUMBNAIL_SIZE, MESSAGE_PATH,
-    SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
+    is_valid_card_id, CreatedLocalTime, HashEntry, HashTransform, Hashes, Manifest, SignatureEntry,
+    SignaturePayload, SignaturePolicy, SignatureProof, SignaturePublicKey, SignatureRequiredKey,
+    SignatureSigner, CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256,
+    INTEGRITY_VERSION_1, MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MAX_THUMBNAIL_SIZE,
+    MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
 };
 use epc_validate::{validate_core_directory, validate_epc_file, ValidationReport};
 use serde_json::{Map, Value};
@@ -42,6 +43,9 @@ pub struct CreateDraftRequest {
     /// Human-facing author name for `manifest.json`.
     pub author_display_name: String,
 
+    /// Device-local creation context captured when the draft is initialized.
+    pub created_local_time: CreatedLocalTime,
+
     /// Whether an existing `manifest.json` should be overwritten.
     pub force: bool,
 }
@@ -52,8 +56,15 @@ impl CreateDraftRequest {
         Self {
             output_dir: output_dir.into(),
             author_display_name: author_display_name.into(),
+            created_local_time: detect_device_created_local_time(),
             force: false,
         }
+    }
+
+    /// Sets the creation time zone metadata supplied by the creating device.
+    pub fn with_created_local_time(mut self, created_local_time: CreatedLocalTime) -> Self {
+        self.created_local_time = created_local_time;
+        self
     }
 
     /// Allows replacing an existing `manifest.json`.
@@ -184,9 +195,10 @@ impl From<zip::result::ZipError> for PackError {
 /// Creates a new unpacked EPC draft directory.
 ///
 /// This writes a fresh `manifest.json` with a generated `escale:<ULID>` id,
-/// current UTC `created_at`, empty `sealed_at`, fixed core-format content
-/// paths, and a starter `text/message.md`. Existing media and message files are
-/// left untouched. Existing manifests are overwritten only when `force` is set.
+/// current UTC `created_at`, device-local creation metadata, empty `sealed_at`,
+/// fixed core-format content paths, and a starter `text/message.md`. Existing
+/// media and message files are left untouched. Existing manifests are
+/// overwritten only when `force` is set.
 pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, PackError> {
     let root = request.output_dir;
     fs::create_dir_all(root.join("media"))?;
@@ -198,6 +210,7 @@ pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, Pa
         object_type: epc_core::EPC_OBJECT_TYPE_POSTCARD.to_string(),
         id: generate_card_id()?,
         created_at: current_utc_timestamp()?,
+        created_local_time: request.created_local_time,
         sealed_at: String::new(),
         author: epc_core::Author {
             display_name: request.author_display_name,
@@ -973,6 +986,88 @@ fn current_utc_timestamp() -> Result<String, PackError> {
     Ok(format_utc_timestamp(seconds))
 }
 
+/// Returns best-effort device-local creation metadata for the current process.
+///
+/// Mobile or embedded callers should prefer `CreateDraftRequest::with_created_local_time`
+/// and pass values read from the device OS at the moment the capsule is created.
+pub fn detect_device_created_local_time() -> CreatedLocalTime {
+    CreatedLocalTime {
+        time_zone: detect_device_time_zone(),
+        utc_offset: detect_device_utc_offset(),
+    }
+}
+
+fn detect_device_time_zone() -> String {
+    std::env::var("ESCALE_DEVICE_TIME_ZONE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("TZ")
+                .ok()
+                .map(|value| value.trim_start_matches(':').to_string())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            fs::read_link("/etc/localtime").ok().and_then(|path| {
+                let text = path.to_string_lossy();
+                text.split("zoneinfo/")
+                    .nth(1)
+                    .map(str::to_string)
+                    .filter(|value| !value.trim().is_empty())
+            })
+        })
+        .unwrap_or_else(|| "Etc/UTC".to_string())
+}
+
+fn detect_device_utc_offset() -> String {
+    std::env::var("ESCALE_DEVICE_UTC_OFFSET")
+        .ok()
+        .and_then(|value| normalize_utc_offset(&value))
+        .or_else(|| {
+            Command::new("date")
+                .arg("+%z")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| normalize_utc_offset(value.trim()))
+        })
+        .unwrap_or_else(|| "+00:00".to_string())
+}
+
+fn normalize_utc_offset(value: &str) -> Option<String> {
+    if value.len() == 6
+        && matches!(value.as_bytes()[0], b'+' | b'-')
+        && &value[3..4] == ":"
+        && is_normalized_utc_offset(value)
+    {
+        return Some(value.to_string());
+    }
+    if value.len() == 5 && matches!(value.as_bytes()[0], b'+' | b'-') {
+        let hours = &value[1..3];
+        let minutes = &value[3..5];
+        if hours.bytes().all(|byte| byte.is_ascii_digit())
+            && minutes.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            let normalized = format!("{}{}:{}", &value[..1], hours, minutes);
+            if is_normalized_utc_offset(&normalized) {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
+fn is_normalized_utc_offset(value: &str) -> bool {
+    let Ok(hour) = value[1..3].parse::<u8>() else {
+        return false;
+    };
+    let Ok(minute) = value[4..6].parse::<u8>() else {
+        return false;
+    };
+    hour <= 23 && minute <= 59
+}
+
 fn generate_card_id() -> Result<String, PackError> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
         PackError::InvalidFilenameMetadata(
@@ -1705,6 +1800,10 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
         "type": "postcard",
         "id": card_id,
         "created_at": "2026-06-17T10:00:00Z",
+        "created_local_time": {
+            "time_zone": "Europe/Paris",
+            "utc_offset": "+02:00"
+        },
         "sealed_at": "2026-06-17T10:05:00Z",
         "author": {
             "display_name": "Bruno"
@@ -1930,6 +2029,8 @@ mod tests {
         assert!(epc_core::is_valid_card_id(&manifest.id));
         assert!(manifest.created_at.ends_with('Z'));
         assert!(manifest.created_at.contains('T'));
+        assert!(!manifest.created_local_time.time_zone.is_empty());
+        assert!(manifest.created_local_time.utc_offset.contains(':'));
         assert_eq!(manifest.sealed_at, "");
         assert_eq!(manifest.author.display_name, "Bruno");
         assert!(draft.path().join(MESSAGE_PATH).exists());
@@ -2157,6 +2258,10 @@ mod tests {
             object_type: "postcard".to_string(),
             id: "escale:00000000000000009X8Q2E5M0A".to_string(),
             created_at: "2026-06-17T10:00:00Z".to_string(),
+            created_local_time: epc_core::CreatedLocalTime {
+                time_zone: "Europe/Paris".to_string(),
+                utc_offset: "+02:00".to_string(),
+            },
             sealed_at: "2026-06-17T10:05:00Z".to_string(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),
@@ -2175,6 +2280,10 @@ mod tests {
             object_type: "postcard".to_string(),
             id: "escale:00000000000000009X8Q2E5M0A".to_string(),
             created_at: "2026-06-17T10:00:00Z".to_string(),
+            created_local_time: epc_core::CreatedLocalTime {
+                time_zone: "Europe/Paris".to_string(),
+                utc_offset: "+02:00".to_string(),
+            },
             sealed_at: String::new(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),
@@ -2193,6 +2302,10 @@ mod tests {
             object_type: "postcard".to_string(),
             id: "escale:00000000000000009X8Q2E5M0A".to_string(),
             created_at: "2026-06-17T10:00:00Z".to_string(),
+            created_local_time: epc_core::CreatedLocalTime {
+                time_zone: "Europe/Paris".to_string(),
+                utc_offset: "+02:00".to_string(),
+            },
             sealed_at: String::new(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),
@@ -2254,6 +2367,10 @@ mod tests {
             "type": "postcard",
             "id": card_id,
             "created_at": "2026-06-17T10:00:00Z",
+            "created_local_time": {
+                "time_zone": "Europe/Paris",
+                "utc_offset": "+02:00"
+            },
             "sealed_at": sealed_at,
             "author": {
                 "display_name": "Bruno"

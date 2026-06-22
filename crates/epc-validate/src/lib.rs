@@ -1074,6 +1074,8 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         );
     }
 
+    validate_created_local_time(manifest, report);
+
     if manifest.author.display_name.trim().is_empty() {
         report.push(
             ValidationIssue::new(
@@ -1125,6 +1127,55 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         "#/content/message/markdown_profile_version",
         report,
     );
+}
+
+fn validate_created_local_time(manifest: &Manifest, report: &mut ValidationReport) {
+    if !is_valid_time_zone(&manifest.created_local_time.time_zone) {
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_MANIFEST_INVALID_CREATED_LOCAL_TIME",
+                "Invalid creation time zone",
+                "created_local_time.time_zone must be a non-empty device time zone identifier.",
+            )
+            .with_file(MANIFEST_PATH)
+            .with_pointer("#/created_local_time/time_zone"),
+        );
+    }
+
+    if !is_valid_utc_offset(&manifest.created_local_time.utc_offset) {
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_MANIFEST_INVALID_CREATED_LOCAL_TIME",
+                "Invalid creation UTC offset",
+                "created_local_time.utc_offset must use +HH:MM or -HH:MM.",
+            )
+            .with_file(MANIFEST_PATH)
+            .with_pointer("#/created_local_time/utc_offset"),
+        );
+    }
+}
+
+fn is_valid_time_zone(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'\\')
+}
+
+fn is_valid_utc_offset(value: &str) -> bool {
+    if value.len() != 6 || !matches!(value.as_bytes()[0], b'+' | b'-') || &value[3..4] != ":" {
+        return false;
+    }
+    let Ok(hour) = value[1..3].parse::<u8>() else {
+        return false;
+    };
+    let Ok(minute) = value[4..6].parse::<u8>() else {
+        return false;
+    };
+    hour <= 23 && minute <= 59
 }
 
 fn expect_markdown_eq(
@@ -1877,6 +1928,10 @@ mod tests {
             "type": "postcard",
             "id": card_id,
             "created_at": "2026-06-17T10:00:00Z",
+            "created_local_time": {
+                "time_zone": "Europe/Paris",
+                "utc_offset": "+02:00"
+            },
             "sealed_at": "2026-06-17T10:05:00Z",
             "author": {
                 "display_name": "Bruno"

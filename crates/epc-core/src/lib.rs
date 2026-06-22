@@ -143,6 +143,9 @@ pub struct Manifest {
     /// Draft or object creation timestamp in UTC RFC 3339 form.
     pub created_at: String,
 
+    /// Device-local creation context captured when the draft was created.
+    pub created_local_time: CreatedLocalTime,
+
     /// Capsule sealing timestamp in UTC RFC 3339 form.
     pub sealed_at: String,
 
@@ -151,6 +154,16 @@ pub struct Manifest {
 
     /// Required readable capsule content.
     pub content: Content,
+}
+
+/// Device-local creation time metadata declared by the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedLocalTime {
+    /// Device time zone identifier at creation time, preferably IANA form.
+    pub time_zone: String,
+
+    /// Device UTC offset at creation time in `+HH:MM` or `-HH:MM` form.
+    pub utc_offset: String,
 }
 
 /// Display author metadata declared by the manifest.

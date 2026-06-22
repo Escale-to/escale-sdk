@@ -4,7 +4,7 @@
     "context": "EPC-SIGNATURE-V1",
     "card_id": "escale:01KVNRF5R9FA4MTNF9QNETS25C",
     "epc_version": "1.0",
-    "core_digest": "5z4U9K27wXEK5wYQOPgx0QTwRkCYJNCXpVDmO0omgjo",
+    "core_digest": "CDhzKbHLgW-Em0bptQSXPexKPgJcX03_bavoOanncRI",
     "hash_algorithm": "sha-256",
     "signed_at": "2026-06-21T20:16:34Z",
     "signer": {
@@ -16,7 +16,7 @@
       "required_keys": [
         {
           "algorithm": "Ed25519",
-          "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4"
+          "key_id": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
         }
       ]
     }
@@ -24,13 +24,13 @@
   "signatures": [
     {
       "algorithm": "Ed25519",
-      "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4",
+      "key_id": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
       "public_key": {
         "kty": "OKP",
         "crv": "Ed25519",
-        "x": "Bd3l4qJSfzVJLcljsEwgcKokLA3acKMgKHnnS80qR6c"
+        "x": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"
       },
-      "value": "WWsdZdkJxEbr5R3YJBloEZ3wdqzMlr5QYjp0yekXHZtKQsOAC_IudAZujBYpl5L0XKDBrgsHpcXJJl5-zj14Dw"
+      "value": "p7jjDqNOZbc-fr0uIYoehqevS0UKfnTBYdDBCLftVx0x0TqQeXiek63EWVi2sdWNCthmBKCW3w7osjD86ku9Dw"
     }
   ]
 }
