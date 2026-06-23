@@ -1,8 +1,91 @@
-//! JPEG XL inspection and display helpers for EPC media resources.
+//! JPEG XL validation, display, and optional encoding helpers for EPC media.
 //!
-//! The public display contract is RGBA8 in an sRGB-like display space. This
-//! gives SDK bindings a stable byte format before platform-specific adapters
-//! are added.
+//! `epc-image` is the SDK layer dedicated to EPC still images. It deliberately
+//! exposes a small, portable contract so that native apps, Flutter bindings,
+//! web adapters, CLIs, and viewers can share the same image rules:
+//!
+//! - validate JPEG XL bitstreams used by EPC media resources;
+//! - decode `media/cover.jxl` or `media/thumbnail.jxl` into RGBA8 pixels;
+//! - resize decoded images for display while preserving aspect ratio;
+//! - derive the canonical EPC thumbnail from a cover image;
+//! - optionally encode JPEG, PNG, or RGBA8 inputs to JPEG XL through `cjxl`.
+//!
+//! The public display format is [`RgbaImage`]: interleaved 8-bit RGBA pixels in
+//! row-major order, with dimensions already adjusted for JPEG XL orientation.
+//! This is intentionally lower-level than platform image objects. Bindings can
+//! wrap the returned bytes as a Flutter `ui.Image`, a browser `ImageData`, a
+//! native bitmap, or a temporary PNG without changing the core SDK behavior.
+//!
+//! # EPC paths and limits
+//!
+//! Image kind selection is explicit through [`EpcImageKind`]. The kind controls
+//! both the canonical EPC path and the resource limits imported from
+//! `epc-core`:
+//!
+//! - [`EpcImageKind::Cover`] maps to `media/cover.jxl`;
+//! - [`EpcImageKind::Thumbnail`] maps to `media/thumbnail.jxl`.
+//!
+//! Validation and display decoding both enforce the configured maximum side and
+//! maximum decoded-pixel limits for the selected kind before returning image
+//! data.
+//!
+//! # Display examples
+//!
+//! Validate a standalone cover:
+//!
+//! ```no_run
+//! use epc_image::{validate_jxl_file, EpcImageKind};
+//!
+//! let info = validate_jxl_file("media/cover.jxl", EpcImageKind::Cover)?;
+//! println!("{}x{} pixels={}", info.width, info.height, info.pixels);
+//! # Ok::<(), epc_image::JxlValidationError>(())
+//! ```
+//!
+//! Render a cover from an unpacked EPC directory:
+//!
+//! ```no_run
+//! use epc_image::{render_cover_from_directory_rgba8, RenderOptions};
+//!
+//! let image = render_cover_from_directory_rgba8(
+//!     "album.epc.unpacked",
+//!     RenderOptions::fit(1024, 1024),
+//! )?;
+//! assert_eq!(image.pixels.len(), image.expected_len());
+//! # Ok::<(), epc_image::DisplayError>(())
+//! ```
+//!
+//! Render a thumbnail directly from a `.epc` archive:
+//!
+//! ```no_run
+//! use epc_image::{render_thumbnail_from_epc_rgba8, RenderOptions};
+//!
+//! let image = render_thumbnail_from_epc_rgba8("album.epc", RenderOptions::fit(256, 256))?;
+//! # let _ = image;
+//! # Ok::<(), epc_image::DisplayError>(())
+//! ```
+//!
+//! # JPEG XL encoding
+//!
+//! Encoding is available only with the `jxl-encode-libjxl` Cargo feature. The
+//! feature keeps the Rust core small by delegating actual JPEG XL encoding to
+//! the reference `cjxl` executable from libjxl. Applications that need writing
+//! support should ensure `cjxl` is installed or pass an explicit executable path
+//! in `EncodeOptions`.
+//!
+//! # Generating docs
+//!
+//! Public API documentation is generated with:
+//!
+//! ```text
+//! cargo doc -p epc-image --no-deps
+//! ```
+//!
+//! Internal helpers are also documented in this file. Include them in the
+//! generated output when auditing the implementation pipeline:
+//!
+//! ```text
+//! cargo doc -p epc-image --no-deps --document-private-items
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -26,6 +109,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Decoded JPEG XL image metadata used by EPC validators.
+///
+/// The dimensions are read after JPEG XL orientation is applied, which means
+/// callers can compare these values directly with the rendered display image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JxlInfo {
     /// Image width after orientation is applied.
@@ -39,6 +125,10 @@ pub struct JxlInfo {
 }
 
 /// RGBA8 image returned by EPC display APIs.
+///
+/// Pixels are always interleaved as `R, G, B, A` bytes in row-major order. A
+/// valid image has exactly `width * height * 4` bytes, which can be checked
+/// with [`RgbaImage::expected_len`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RgbaImage {
     /// Image width in pixels.
@@ -47,12 +137,15 @@ pub struct RgbaImage {
     /// Image height in pixels.
     pub height: u32,
 
-    /// Interleaved RGBA8 pixels, row-major.
+    /// Interleaved RGBA8 pixels in `R, G, B, A` channel order.
     pub pixels: Vec<u8>,
 }
 
 impl RgbaImage {
     /// Returns the expected byte length for this image.
+    ///
+    /// The value is `width * height * 4`, or `0` if the dimensions overflow
+    /// `usize` on the current platform.
     pub fn expected_len(&self) -> usize {
         rgba_len(self.width, self.height).unwrap_or(0)
     }
@@ -61,20 +154,29 @@ impl RgbaImage {
 /// Resize policy used by display rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeMode {
-    /// Keep source dimensions.
+    /// Keep decoded source dimensions.
+    ///
+    /// EPC size limits are still enforced before the image is returned.
     Original,
 
     /// Fit within optional maximum dimensions while preserving aspect ratio.
+    ///
+    /// Rendering never upscales. If the decoded image already fits inside the
+    /// requested box, the original decoded dimensions are kept.
     Fit,
 }
 
 /// Display rendering options.
+///
+/// The default uses [`ResizeMode::Fit`] without explicit maximum dimensions,
+/// which preserves the decoded size while still validating that the image fits
+/// EPC limits. Use [`RenderOptions::fit`] for UI preview surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
-    /// Optional maximum output width.
+    /// Optional maximum output width used by [`ResizeMode::Fit`].
     pub max_width: Option<u32>,
 
-    /// Optional maximum output height.
+    /// Optional maximum output height used by [`ResizeMode::Fit`].
     pub max_height: Option<u32>,
 
     /// Resize mode.
@@ -82,6 +184,7 @@ pub struct RenderOptions {
 }
 
 impl Default for RenderOptions {
+    /// Builds display options that preserve decoded dimensions by default.
     fn default() -> Self {
         Self {
             max_width: None,
@@ -93,6 +196,9 @@ impl Default for RenderOptions {
 
 impl RenderOptions {
     /// Creates options that keep the decoded image at its original dimensions.
+    ///
+    /// This is useful when a caller wants to build its own mipmaps, thumbnails,
+    /// or native image objects after decoding.
     pub fn original() -> Self {
         Self {
             resize: ResizeMode::Original,
@@ -101,6 +207,9 @@ impl RenderOptions {
     }
 
     /// Creates options that fit the decoded image within the given box.
+    ///
+    /// Both dimensions must be greater than zero. The aspect ratio is preserved
+    /// and the image is not upscaled.
     pub fn fit(max_width: u32, max_height: u32) -> Self {
         Self {
             max_width: Some(max_width),
@@ -110,7 +219,7 @@ impl RenderOptions {
     }
 }
 
-/// EPC image class used to select resource limits.
+/// EPC image class used to select the canonical media path and resource limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpcImageKind {
     /// `media/cover.jxl`.
@@ -122,6 +231,8 @@ pub enum EpcImageKind {
 
 impl EpcImageKind {
     /// Returns the EPC image kind for a canonical capsule path.
+    ///
+    /// Non-image paths and non-canonical aliases return `None`.
     pub fn from_core_path(path: &str) -> Option<Self> {
         match path {
             COVER_PATH => Some(Self::Cover),
@@ -162,6 +273,9 @@ pub enum JxlValidationError {
     Io(io::Error),
 
     /// The JPEG XL header cannot be parsed.
+    ///
+    /// This usually means the file is not JPEG XL, is truncated, or uses a
+    /// bitstream feature unsupported by the current decoder.
     InvalidBitstream(String),
 
     /// The decoded dimensions exceed the per-side image limit.
@@ -186,6 +300,10 @@ pub enum JxlValidationError {
     },
 
     /// The first frame could not be rendered.
+    ///
+    /// EPC Phase 1 validation intentionally renders the first frame, rather
+    /// than only checking the container signature, so corrupt payloads fail
+    /// before an application tries to display them.
     DecodeFailed(String),
 }
 
@@ -221,10 +339,17 @@ pub enum DisplayError {
 }
 
 /// Options for JPEG XL encoding through the reference `cjxl` tool.
+///
+/// This type is available only with the `jxl-encode-libjxl` Cargo feature. The
+/// default favors lossless output (`distance = 0`) with a moderate encoder
+/// effort. Applications can choose either distance-oriented or quality-oriented
+/// options depending on the UX they expose.
 #[cfg(feature = "jxl-encode-libjxl")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodeOptions {
     /// Path or executable name for `cjxl`.
+    ///
+    /// The default is `cjxl`, resolved through the process `PATH`.
     pub cjxl_path: OsString,
 
     /// Optional JPEG XL distance. `0.0` requests mathematically lossless output
@@ -232,14 +357,20 @@ pub struct EncodeOptions {
     pub distance: Option<f32>,
 
     /// Optional JPEG XL quality value.
+    ///
+    /// Use [`EncodeOptions::with_quality`] to set this in preference to
+    /// distance for simple UI sliders.
     pub quality: Option<f32>,
 
     /// Optional encoder effort.
+    ///
+    /// Higher values generally improve compression at the cost of CPU time.
     pub effort: Option<u8>,
 }
 
 #[cfg(feature = "jxl-encode-libjxl")]
 impl Default for EncodeOptions {
+    /// Builds lossless-oriented `cjxl` encoding options.
     fn default() -> Self {
         Self {
             cjxl_path: OsString::from("cjxl"),
@@ -259,6 +390,8 @@ impl EncodeOptions {
     }
 
     /// Sets the JPEG XL distance.
+    ///
+    /// `0.0` requests mathematically lossless output for suitable sources.
     pub fn with_distance(mut self, distance: f32) -> Self {
         self.distance = Some(distance);
         self
@@ -308,15 +441,67 @@ pub enum EncodeError {
         /// Captured stderr text.
         stderr: String,
     },
+
+    /// The configured `cjxl` executable could not be started.
+    CjxlUnavailable {
+        /// Configured executable path.
+        path: OsString,
+
+        /// Underlying I/O error.
+        source: io::Error,
+    },
+}
+
+/// Error returned while deriving and encoding a thumbnail from a cover.
+#[cfg(feature = "jxl-encode-libjxl")]
+#[derive(Debug)]
+pub enum ThumbnailError {
+    /// The cover could not be decoded or resized.
+    Display(DisplayError),
+
+    /// The thumbnail could not be encoded.
+    Encode(EncodeError),
+
+    /// The encoded thumbnail does not satisfy EPC thumbnail limits.
+    Validation(JxlValidationError),
 }
 
 impl From<JxlValidationError> for DisplayError {
+    /// Wraps JPEG XL validation errors in the display error type.
     fn from(error: JxlValidationError) -> Self {
         Self::Jxl(error)
     }
 }
 
+#[cfg(feature = "jxl-encode-libjxl")]
+impl From<DisplayError> for ThumbnailError {
+    /// Wraps display errors in the thumbnail generation error type.
+    fn from(error: DisplayError) -> Self {
+        Self::Display(error)
+    }
+}
+
+#[cfg(feature = "jxl-encode-libjxl")]
+impl From<EncodeError> for ThumbnailError {
+    /// Wraps encoding errors in the thumbnail generation error type.
+    fn from(error: EncodeError) -> Self {
+        Self::Encode(error)
+    }
+}
+
+#[cfg(feature = "jxl-encode-libjxl")]
+impl From<JxlValidationError> for ThumbnailError {
+    /// Wraps validation errors in the thumbnail generation error type.
+    fn from(error: JxlValidationError) -> Self {
+        Self::Validation(error)
+    }
+}
+
 /// Validates that a file is a decodable JPEG XL still image within EPC limits.
+///
+/// Validation parses the JPEG XL header, checks the selected [`EpcImageKind`]
+/// limits, and renders the first frame to prove the payload is actually
+/// decodable. It does not inspect EPC manifests or proof metadata.
 pub fn validate_jxl_file(
     path: impl AsRef<Path>,
     kind: EpcImageKind,
@@ -330,6 +515,10 @@ pub fn validate_jxl_file(
 }
 
 /// Decodes JPEG XL bytes into RGBA8, optionally resizing for display.
+///
+/// Use this when the caller already loaded `media/cover.jxl` or
+/// `media/thumbnail.jxl` from another storage layer. The selected
+/// [`EpcImageKind`] still controls validation limits.
 pub fn decode_jxl_rgba8(
     bytes: &[u8],
     kind: EpcImageKind,
@@ -342,6 +531,8 @@ pub fn decode_jxl_rgba8(
 }
 
 /// Reads and decodes a JPEG XL file into RGBA8, optionally resizing for display.
+///
+/// This is the standalone-file equivalent of [`decode_jxl_rgba8`].
 pub fn decode_jxl_file_rgba8(
     path: impl AsRef<Path>,
     kind: EpcImageKind,
@@ -372,6 +563,9 @@ pub fn render_thumbnail_from_directory_rgba8(
 }
 
 /// Renders an EPC image from an unpacked directory as RGBA8.
+///
+/// `root` must be the directory that contains canonical EPC entries such as
+/// `media/cover.jxl`. The function reads only the image selected by `kind`.
 pub fn render_image_from_directory_rgba8(
     root: impl AsRef<Path>,
     kind: EpcImageKind,
@@ -397,6 +591,10 @@ pub fn render_thumbnail_from_epc_rgba8(
 }
 
 /// Renders an EPC image from a `.epc` archive as RGBA8.
+///
+/// The archive is opened as ZIP and only the selected image entry is extracted.
+/// This helper is for display; full EPC validation remains the responsibility
+/// of the validation layer.
 pub fn render_image_from_epc_rgba8(
     epc_file: impl AsRef<Path>,
     kind: EpcImageKind,
@@ -415,7 +613,97 @@ pub fn render_image_from_epc_rgba8(
     decode_jxl_rgba8(&bytes, kind, options)
 }
 
+/// Resizes an RGBA8 image to fit within a maximum box.
+///
+/// The aspect ratio is preserved, the image is not cropped, and images already
+/// fitting inside the requested box are returned unchanged.
+pub fn resize_rgba8_to_fit(
+    image: &RgbaImage,
+    max_width: u32,
+    max_height: u32,
+) -> Result<RgbaImage, DisplayError> {
+    validate_rgba_display_image(image)?;
+    let (target_width, target_height) = target_dimensions(
+        image.width,
+        image.height,
+        RenderOptions::fit(max_width, max_height),
+    )?;
+    if target_width == image.width && target_height == image.height {
+        Ok(image.clone())
+    } else {
+        resize_rgba8(image, target_width, target_height)
+    }
+}
+
+/// Derives the canonical EPC thumbnail pixels from a decoded cover image.
+///
+/// This applies the EPC thumbnail rule: fit within 1024x1024 pixels, preserve
+/// the cover aspect ratio, do not crop, and do not upscale.
+pub fn derive_thumbnail_rgba8_from_cover(cover: &RgbaImage) -> Result<RgbaImage, DisplayError> {
+    resize_rgba8_to_fit(cover, MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_DIMENSION)
+}
+
+/// Decodes cover JPEG XL bytes and derives canonical EPC thumbnail pixels.
+///
+/// The input is validated with cover limits before it is resized to the
+/// thumbnail bounds.
+pub fn derive_thumbnail_rgba8_from_cover_jxl(bytes: &[u8]) -> Result<RgbaImage, DisplayError> {
+    decode_jxl_rgba8(
+        bytes,
+        EpcImageKind::Cover,
+        RenderOptions::fit(MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_DIMENSION),
+    )
+}
+
+/// Reads a cover JPEG XL file and derives canonical EPC thumbnail pixels.
+///
+/// Use [`encode_rgba8_to_jxl_file`] afterwards when the `jxl-encode-libjxl`
+/// feature is enabled to write the thumbnail to `media/thumbnail.jxl`.
+pub fn derive_thumbnail_rgba8_from_cover_jxl_file(
+    cover_file: impl AsRef<Path>,
+) -> Result<RgbaImage, DisplayError> {
+    decode_jxl_file_rgba8(
+        cover_file,
+        EpcImageKind::Cover,
+        RenderOptions::fit(MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_DIMENSION),
+    )
+}
+
+/// Encodes canonical EPC thumbnail bytes from cover JPEG XL bytes.
+///
+/// This is the in-memory equivalent of
+/// [`encode_thumbnail_from_cover_jxl_file`].
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn encode_thumbnail_from_cover_jxl_bytes(
+    cover_jxl: &[u8],
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, ThumbnailError> {
+    let thumbnail = derive_thumbnail_rgba8_from_cover_jxl(cover_jxl)?;
+    let bytes = encode_rgba8_to_jxl_bytes(&thumbnail, options)?;
+    decode_jxl_rgba8(&bytes, EpcImageKind::Thumbnail, RenderOptions::original())?;
+    Ok(bytes)
+}
+
+/// Encodes a canonical EPC thumbnail file from a cover JPEG XL file.
+///
+/// The cover is decoded with cover limits, resized with the EPC thumbnail rule,
+/// encoded as JPEG XL, and validated with thumbnail limits.
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn encode_thumbnail_from_cover_jxl_file(
+    cover_file: impl AsRef<Path>,
+    thumbnail_file: impl AsRef<Path>,
+    options: &EncodeOptions,
+) -> Result<(), ThumbnailError> {
+    let thumbnail = derive_thumbnail_rgba8_from_cover_jxl_file(cover_file)?;
+    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), options)?;
+    validate_jxl_file(thumbnail_file, EpcImageKind::Thumbnail)?;
+    Ok(())
+}
+
 /// Encodes a JPEG file into JPEG XL using `cjxl`.
+///
+/// The input is passed directly to `cjxl`; no Rust-side color conversion or
+/// resizing is performed.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_jpeg_file_to_jxl_file(
     input_file: impl AsRef<Path>,
@@ -426,6 +714,9 @@ pub fn encode_jpeg_file_to_jxl_file(
 }
 
 /// Encodes a PNG file into JPEG XL using `cjxl`.
+///
+/// The input is passed directly to `cjxl`; no Rust-side color conversion or
+/// resizing is performed.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_png_file_to_jxl_file(
     input_file: impl AsRef<Path>,
@@ -436,6 +727,9 @@ pub fn encode_png_file_to_jxl_file(
 }
 
 /// Encodes an input image file supported by `cjxl` into JPEG XL.
+///
+/// This is the generic file-based encoder entry point. Prefer the typed helper
+/// names in CLI and binding APIs when they make user intent clearer.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_file_to_jxl_file(
     input_file: impl AsRef<Path>,
@@ -447,6 +741,9 @@ pub fn encode_file_to_jxl_file(
 }
 
 /// Encodes RGBA8 pixels into a JPEG XL file using a temporary PNG and `cjxl`.
+///
+/// The temporary PNG is an implementation detail used to feed `cjxl` a
+/// lossless, broadly supported input format.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_rgba8_to_jxl_file(
     image: &RgbaImage,
@@ -462,6 +759,9 @@ pub fn encode_rgba8_to_jxl_file(
 }
 
 /// Encodes RGBA8 pixels into JPEG XL bytes.
+///
+/// This is convenient for bindings that want to write the resulting bytes into
+/// an EPC package without managing an intermediate output file themselves.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_rgba8_to_jxl_bytes(
     image: &RgbaImage,
@@ -472,6 +772,24 @@ pub fn encode_rgba8_to_jxl_bytes(
     std::fs::read(temp_jxl.path()).map_err(EncodeError::Io)
 }
 
+/// Writes RGBA8 pixels to a PNG file.
+///
+/// This helper is primarily useful for debugging, preview generation, or the
+/// RGBA-to-JXL staging path. PNG is not the canonical EPC still-image format.
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn write_rgba_png_file(
+    image: &RgbaImage,
+    output_file: impl AsRef<Path>,
+) -> Result<(), EncodeError> {
+    validate_rgba_image(image)?;
+    write_rgba_png(output_file.as_ref(), image)
+}
+
+/// Validates an already parsed JPEG XL image.
+///
+/// This shared helper is used by file validation. It checks EPC image limits
+/// and renders the first frame so that malformed payloads fail during
+/// validation rather than later in a viewer.
 fn validate_jxl_image(image: JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValidationError> {
     let info = image_info(&image, kind)?;
     image
@@ -480,6 +798,10 @@ fn validate_jxl_image(image: JxlImage, kind: EpcImageKind) -> Result<JxlInfo, Jx
     Ok(info)
 }
 
+/// Decodes an already parsed JPEG XL image into the SDK RGBA8 display format.
+///
+/// The function centralizes the display pipeline: render first frame, normalize
+/// channels to RGBA8, compute target dimensions, and resize only when needed.
 fn decode_jxl_image(
     image: JxlImage,
     kind: EpcImageKind,
@@ -509,6 +831,10 @@ fn decode_jxl_image(
     }
 }
 
+/// Extracts oriented JPEG XL dimensions and applies EPC resource limits.
+///
+/// This function performs metadata-only checks. Callers that need proof of full
+/// decodability must render a frame after calling it.
 fn image_info(image: &JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValidationError> {
     let header = image.image_header();
     let width = header.width_with_orientation();
@@ -537,6 +863,11 @@ fn image_info(image: &JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValida
     })
 }
 
+/// Converts decoder samples into interleaved RGBA8 pixels.
+///
+/// The JPEG XL decoder may return grayscale, grayscale plus alpha, RGB, or
+/// RGBA streams. This helper expands all supported layouts into the stable
+/// [`RgbaImage`] contract.
 fn samples_to_rgba8(
     width: u32,
     height: u32,
@@ -588,6 +919,10 @@ fn samples_to_rgba8(
     })
 }
 
+/// Computes display dimensions for the requested resize policy.
+///
+/// The calculation preserves aspect ratio, rejects zero-sized targets, and
+/// never upscales an image that already fits within the requested box.
 fn target_dimensions(
     width: u32,
     height: u32,
@@ -621,6 +956,11 @@ fn target_dimensions(
     Ok((target_width, target_height))
 }
 
+/// Resizes an RGBA8 image with bilinear interpolation.
+///
+/// This lightweight scaler is intended for display previews. It keeps the SDK
+/// independent of platform image APIs while producing stable RGBA8 output for
+/// bindings.
 fn resize_rgba8(
     image: &RgbaImage,
     target_width: u32,
@@ -678,6 +1018,7 @@ fn resize_rgba8(
     })
 }
 
+/// Validates render options before decoding allocates image buffers.
 fn validate_options(options: RenderOptions) -> Result<(), DisplayError> {
     if matches!(options.max_width, Some(0)) || matches!(options.max_height, Some(0)) {
         return Err(DisplayError::InvalidOptions(
@@ -687,6 +1028,18 @@ fn validate_options(options: RenderOptions) -> Result<(), DisplayError> {
     Ok(())
 }
 
+/// Validates that an [`RgbaImage`] has exactly one RGBA byte tuple per pixel.
+fn validate_rgba_display_image(image: &RgbaImage) -> Result<(), DisplayError> {
+    let expected = rgba_len(image.width, image.height).ok_or(DisplayError::ImageTooLarge)?;
+    if image.pixels.len() != expected {
+        return Err(DisplayError::ImageTooLarge);
+    }
+    Ok(())
+}
+
+/// Computes the sample buffer length for a decoded stream.
+///
+/// Returns `None` if the multiplication does not fit in `usize`.
 fn samples_len(width: u32, height: u32, channels: u32) -> Option<usize> {
     usize::try_from(width)
         .ok()?
@@ -694,16 +1047,23 @@ fn samples_len(width: u32, height: u32, channels: u32) -> Option<usize> {
         .checked_mul(usize::try_from(channels).ok()?)
 }
 
+/// Computes the pixel count for an image.
+///
+/// Returns `None` if the multiplication does not fit in `usize`.
 fn pixel_count(width: u32, height: u32) -> Option<usize> {
     usize::try_from(width)
         .ok()?
         .checked_mul(usize::try_from(height).ok()?)
 }
 
+/// Computes the byte length of an RGBA8 image.
+///
+/// Returns `None` if the multiplication does not fit in `usize`.
 fn rgba_len(width: u32, height: u32) -> Option<usize> {
     pixel_count(width, height)?.checked_mul(4)
 }
 
+/// Validates user-controlled `cjxl` encoder options.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn validate_encode_options(options: &EncodeOptions) -> Result<(), EncodeError> {
     if let Some(distance) = options.distance {
@@ -731,6 +1091,7 @@ fn validate_encode_options(options: &EncodeOptions) -> Result<(), EncodeError> {
     Ok(())
 }
 
+/// Validates that an [`RgbaImage`] has exactly one RGBA byte tuple per pixel.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn validate_rgba_image(image: &RgbaImage) -> Result<(), EncodeError> {
     let expected = rgba_len(image.width, image.height).ok_or(EncodeError::InvalidOptions(
@@ -745,6 +1106,7 @@ fn validate_rgba_image(image: &RgbaImage) -> Result<(), EncodeError> {
     Ok(())
 }
 
+/// Writes an RGBA8 image to PNG for debugging or `cjxl` staging.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn write_rgba_png(path: &Path, image: &RgbaImage) -> Result<(), EncodeError> {
     let file = File::create(path).map_err(EncodeError::Io)?;
@@ -759,6 +1121,10 @@ fn write_rgba_png(path: &Path, image: &RgbaImage) -> Result<(), EncodeError> {
         .map_err(|error| EncodeError::Png(error.to_string()))
 }
 
+/// Invokes the configured `cjxl` executable with validated options.
+///
+/// The function captures stderr on encoder failure so CLI and binding layers
+/// can surface useful diagnostics to users.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn run_cjxl(
     input_file: &Path,
@@ -786,7 +1152,12 @@ fn run_cjxl(
         command.arg("-e").arg(&effort);
     }
 
-    let output = command.output().map_err(EncodeError::Io)?;
+    let output = command
+        .output()
+        .map_err(|source| EncodeError::CjxlUnavailable {
+            path: options.cjxl_path.clone(),
+            source,
+        })?;
     if output.status.success() {
         Ok(())
     } else {
@@ -797,13 +1168,22 @@ fn run_cjxl(
     }
 }
 
+/// Temporary file removed when dropped.
+///
+/// The encoder uses this for PNG staging and byte-returning JXL output without
+/// pulling in an additional temporary-file dependency.
 #[cfg(feature = "jxl-encode-libjxl")]
 struct TempFile {
+    /// Filesystem path of the temporary file.
     path: std::path::PathBuf,
 }
 
 #[cfg(feature = "jxl-encode-libjxl")]
 impl TempFile {
+    /// Creates a best-effort unique temporary path.
+    ///
+    /// The file is not opened immediately; callers create it through the writer
+    /// or encoder that needs the path.
     fn new(prefix: &str, extension: &str) -> Result<Self, EncodeError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -818,6 +1198,7 @@ impl TempFile {
         Ok(Self { path })
     }
 
+    /// Returns the temporary file path.
     fn path(&self) -> &Path {
         &self.path
     }
@@ -825,6 +1206,7 @@ impl TempFile {
 
 #[cfg(feature = "jxl-encode-libjxl")]
 impl Drop for TempFile {
+    /// Removes the temporary file if it still exists.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -876,6 +1258,37 @@ mod tests {
     }
 
     #[test]
+    fn resize_rgba8_to_fit_preserves_aspect_ratio() {
+        let image = RgbaImage {
+            width: 4,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0,
+                0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+
+        let resized = resize_rgba8_to_fit(&image, 2, 2).unwrap();
+
+        assert_eq!(resized.width, 2);
+        assert_eq!(resized.height, 1);
+        assert_eq!(resized.pixels.len(), resized.expected_len());
+    }
+
+    #[test]
+    fn derives_thumbnail_from_cover_file() {
+        let image = derive_thumbnail_rgba8_from_cover_jxl_file(format!(
+            "{}/../../testcases/image/cover.jxl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+
+        assert!(image.width <= MAX_THUMBNAIL_DIMENSION);
+        assert!(image.height <= MAX_THUMBNAIL_DIMENSION);
+        assert_eq!(image.pixels.len(), image.expected_len());
+    }
+
+    #[test]
     fn renders_cover_from_epc_archive() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -921,5 +1334,25 @@ mod tests {
         assert_eq!(decoded.width, 2);
         assert_eq!(decoded.height, 2);
         assert_eq!(decoded.pixels.len(), 16);
+    }
+
+    #[cfg(feature = "jxl-encode-libjxl")]
+    #[test]
+    fn encodes_thumbnail_from_cover_bytes_with_cjxl_when_available() {
+        if Command::new("cjxl").arg("--version").output().is_err() {
+            return;
+        }
+
+        let bytes = encode_thumbnail_from_cover_jxl_bytes(
+            include_bytes!("../../../testcases/image/cover.jxl"),
+            &EncodeOptions::default(),
+        )
+        .unwrap();
+        let decoded =
+            decode_jxl_rgba8(&bytes, EpcImageKind::Thumbnail, RenderOptions::original()).unwrap();
+
+        assert!(decoded.width <= MAX_THUMBNAIL_DIMENSION);
+        assert!(decoded.height <= MAX_THUMBNAIL_DIMENSION);
+        assert_eq!(decoded.pixels.len(), decoded.expected_len());
     }
 }

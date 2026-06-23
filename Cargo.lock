@@ -225,6 +225,7 @@ name = "epc-cli"
 version = "0.1.0"
 dependencies = [
  "epc-core",
+ "epc-image",
  "epc-pack",
  "epc-validate",
  "serde_json",

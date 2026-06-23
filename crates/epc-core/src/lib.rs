@@ -125,10 +125,10 @@ pub const MAX_COVER_PIXELS: u64 = 24_000_000;
 pub const MAX_COVER_DIMENSION: u32 = 8192;
 
 /// Maximum decoded thumbnail image pixels.
-pub const MAX_THUMBNAIL_PIXELS: u64 = 1_000_000;
+pub const MAX_THUMBNAIL_PIXELS: u64 = 1024 * 1024;
 
 /// Maximum decoded thumbnail image width or height in pixels.
-pub const MAX_THUMBNAIL_DIMENSION: u32 = 2048;
+pub const MAX_THUMBNAIL_DIMENSION: u32 = 1024;
 
 /// Maximum number of Markdown links allowed by `epc-markdown-core`.
 pub const MAX_MARKDOWN_LINKS: usize = 32;

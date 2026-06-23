@@ -43,6 +43,11 @@ Available commands:
 cargo run -p epc-cli -- validate <capsule.epc>
 cargo run -p epc-cli -- validate-dir <unpacked-capsule-dir>
 cargo run -p epc-cli -- create [--force] <draft-dir> <author-display-name>
+cargo run -p epc-cli -- image info <image.jxl> [--kind cover|thumbnail]
+cargo run -p epc-cli -- image validate <image.jxl> --kind cover|thumbnail
+cargo run -p epc-cli -- image preview <image.jxl> --out <preview.png> [--max <px>]
+cargo run -p epc-cli -- image encode <input.jpg|png> <output.jxl> --kind cover|thumbnail
+cargo run -p epc-cli -- image prepare <input.jpg|png> <draft-dir>
 cargo run -p epc-cli -- sign --ssh-key <ssh-ed25519-key> <source-dir>
 cargo run -p epc-cli -- pack <source-dir> [output-dir]
 cargo run -p epc-cli -- pack --sign <ssh-ed25519-key> <source-dir> [output-dir]
@@ -88,6 +93,7 @@ Capsule creation:
 
 ```sh
 cargo run -p epc-cli -- create ../my-card "Bruno"
+cargo run -p epc-cli -- image prepare ../photo.jpg ../my-card
 ```
 
 This creates:
@@ -100,8 +106,9 @@ my-card/
     message.md
 ```
 
-Add `media/cover.jxl`, `media/thumbnail.jxl`, and edit `text/message.md` before
-packing.
+`image prepare` writes `media/cover.jxl` and derives `media/thumbnail.jxl` from
+that cover with a 1024x1024 fit, preserving aspect ratio without cropping or
+upscaling. Edit `text/message.md` before packing.
 
 No need to create `proof/hashes.json` because `pack` generates it
 automatically before writing the `.epc` file.
