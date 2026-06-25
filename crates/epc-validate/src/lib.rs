@@ -21,13 +21,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use epc_core::{
-    expected_file_size_limit, is_allowed_regular_file, is_expected_hashed_core_file,
-    is_safe_core_path, is_valid_card_id, HashEntry, HashTransform, Hashes, Manifest,
-    SignatureProof, CORE_DOMAIN_SEPARATOR, CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD,
-    EPC_VERSION_1_0, HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH,
-    MARKDOWN_CORE_PROFILE, MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE,
-    MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS, MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE,
-    MAX_ZIP_ENTRIES, MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
+    cover_mime_for_path, expected_file_size_limit, is_allowed_regular_file,
+    is_expected_hashed_core_file, is_safe_core_path, is_supported_cover_path, is_valid_card_id,
+    HashEntry, HashTransform, Hashes, Manifest, SignatureProof, CORE_DOMAIN_SEPARATOR,
+    CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0, HASHES_PATH,
+    HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
+    MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE, MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS,
+    MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_ZIP_ENTRIES, MESSAGE_PATH,
+    SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
 };
 #[cfg(feature = "jxl")]
 use epc_image::{EpcImageKind, JxlValidationError};
@@ -244,6 +245,34 @@ pub struct ValidationReport {
     pub issues: Vec<ValidationIssue>,
 }
 
+/// Options controlling expensive validation passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationOptions {
+    /// Whether JPEG XL content should be decoded and checked against EPC image
+    /// limits.
+    pub validate_jxl_images: bool,
+}
+
+impl Default for ValidationOptions {
+    fn default() -> Self {
+        Self {
+            validate_jxl_images: true,
+        }
+    }
+}
+
+impl ValidationOptions {
+    /// Returns options that skip JPEG XL decoding.
+    ///
+    /// This is intended for trusted internal flows that have just performed a
+    /// full image validation and only need to re-check manifest, hash, and
+    /// signature consistency.
+    pub fn without_jxl_images(mut self) -> Self {
+        self.validate_jxl_images = false;
+        self
+    }
+}
+
 impl Default for ValidationReport {
     fn default() -> Self {
         Self::new(CORE_PROFILE, EPC_VERSION_1_0)
@@ -328,6 +357,14 @@ impl CoreDirectoryValidator {
     /// This method does not panic for invalid capsules. Filesystem errors are
     /// represented as fatal issues whenever they prevent safe validation.
     pub fn validate(&self) -> ValidationReport {
+        self.validate_with_options(ValidationOptions::default())
+    }
+
+    /// Validates the directory with explicit validation options.
+    pub fn validate_with_options(&self, options: ValidationOptions) -> ValidationReport {
+        #[cfg(not(feature = "jxl"))]
+        let _ = options;
+
         let mut report = ValidationReport::default();
         let mut files = BTreeSet::new();
         let mut total_size = 0_u64;
@@ -364,7 +401,33 @@ impl CoreDirectoryValidator {
             .chain(self.observed_files.iter().cloned())
             .collect::<BTreeSet<_>>();
 
+        let cover_files = observed_files
+            .iter()
+            .filter(|path| is_supported_cover_path(path))
+            .count();
+
         for expected in epc_core::EXPECTED_CORE_FILES {
+            if expected == COVER_PATH {
+                if cover_files == 0 {
+                    report.push(
+                        ValidationIssue::new(
+                            IssueSeverity::Error,
+                            "EPC_CONTENT_MISSING_FILE",
+                            "Content file missing",
+                            "The required cover image is missing.",
+                        )
+                        .with_file(COVER_PATH),
+                    );
+                } else if cover_files > 1 {
+                    report.push(ValidationIssue::new(
+                        IssueSeverity::Error,
+                        "EPC_CONTENT_MULTIPLE_COVER_FILES",
+                        "Multiple cover files",
+                        "A core-format capsule must contain exactly one cover image.",
+                    ));
+                }
+                continue;
+            }
             if !observed_files.contains(expected) {
                 let (code, title) = match expected {
                     MANIFEST_PATH => ("EPC_MANIFEST_MISSING", "Manifest missing"),
@@ -438,18 +501,32 @@ impl CoreDirectoryValidator {
             report.epc_version = manifest.epc_version.clone();
             report.profile = manifest.profile.clone();
             validate_manifest(manifest, &mut report);
+            if !observed_files.contains(&manifest.content.cover.path) {
+                report.push(
+                    ValidationIssue::new(
+                        IssueSeverity::Error,
+                        "EPC_CONTENT_MISSING_FILE",
+                        "Declared cover missing",
+                        "The cover file declared by manifest.json is missing.",
+                    )
+                    .with_file(&manifest.content.cover.path)
+                    .with_pointer("#/content/cover/path"),
+                );
+            }
         }
 
         validate_markdown(&self.root, &mut report);
         #[cfg(feature = "jxl")]
-        validate_jxl_images(&self.root, &files, &mut report);
+        if options.validate_jxl_images {
+            validate_jxl_images(&self.root, &files, &mut report);
+        }
 
         let hashes = read_hashes(&self.root, &mut report);
         if let Some(hashes) = &hashes {
             report.proofs.integrity.present = true;
             report.proofs.integrity.hash_algorithm = Some(hashes.hash_algorithm.clone());
             report.proofs.integrity.core_digest = Some(hashes.core_digest.clone());
-            validate_hashes_schema(hashes, &mut report);
+            validate_hashes_schema(hashes, manifest.as_ref(), &mut report);
         }
 
         if !report.has_fatal() {
@@ -471,6 +548,14 @@ impl CoreDirectoryValidator {
 /// This is the convenience entry point used by the CLI.
 pub fn validate_core_directory(root: impl Into<PathBuf>) -> ValidationReport {
     CoreDirectoryValidator::new(root).validate()
+}
+
+/// Validates an unpacked EPC directory with explicit validation options.
+pub fn validate_core_directory_with_options(
+    root: impl Into<PathBuf>,
+    options: ValidationOptions,
+) -> ValidationReport {
+    CoreDirectoryValidator::new(root).validate_with_options(options)
 }
 
 /// Validates a `.epc` ZIP archive as an EPC 1.0 `core-format` capsule.
@@ -778,7 +863,7 @@ fn file_size_issue_code(path: &str) -> &'static str {
 }
 
 fn is_warnable_empty_content_file(path: &str) -> bool {
-    matches!(path, COVER_PATH | THUMBNAIL_PATH | MESSAGE_PATH)
+    is_supported_cover_path(path) || matches!(path, THUMBNAIL_PATH | MESSAGE_PATH)
 }
 
 fn is_zip_symlink(unix_mode: Option<u32>) -> bool {
@@ -1094,14 +1179,26 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         );
     }
 
-    validate_content_ref(
-        &manifest.content.cover.path,
-        &manifest.content.cover.mime,
-        COVER_PATH,
-        "image/jxl",
-        "#/content/cover",
-        report,
-    );
+    match cover_mime_for_path(&manifest.content.cover.path) {
+        Some(expected_mime) => validate_content_ref(
+            &manifest.content.cover.path,
+            &manifest.content.cover.mime,
+            &manifest.content.cover.path,
+            expected_mime,
+            "#/content/cover",
+            report,
+        ),
+        None => report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "EPC_MANIFEST_UNEXPECTED_CONTENT_PATH",
+                "Unexpected content path",
+                "content.cover.path must be media/cover.jpg, media/cover.jpeg, media/cover.png, or media/cover.jxl.",
+            )
+            .with_file(MANIFEST_PATH)
+            .with_pointer("#/content/cover/path"),
+        ),
+    }
     validate_content_ref(
         &manifest.content.thumbnail.path,
         &manifest.content.thumbnail.mime,
@@ -1439,7 +1536,11 @@ fn markdown_link_targets(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn validate_hashes_schema(hashes: &Hashes, report: &mut ValidationReport) {
+fn validate_hashes_schema(
+    hashes: &Hashes,
+    manifest: Option<&Manifest>,
+    report: &mut ValidationReport,
+) {
     if hashes.integrity_version != INTEGRITY_VERSION_1 {
         report.push(
             ValidationIssue::new(
@@ -1505,7 +1606,10 @@ fn validate_hashes_schema(hashes: &Hashes, report: &mut ValidationReport) {
         }
     }
 
-    for expected in epc_core::EXPECTED_HASHED_CORE_FILES {
+    let cover_path = manifest
+        .map(|manifest| manifest.content.cover.path.as_str())
+        .unwrap_or(COVER_PATH);
+    for expected in [MANIFEST_PATH, cover_path, THUMBNAIL_PATH, MESSAGE_PATH] {
         if !paths.contains(expected) {
             report.push(
                 ValidationIssue::new(
@@ -1917,6 +2021,21 @@ mod tests {
     }
 
     #[test]
+    fn validates_minimal_core_directory_with_jpeg_cover() {
+        let root = TestDir::new();
+        write_minimal_capsule_with_cover(
+            root.path(),
+            "escale:00000000000000000000000000",
+            "media/cover.jpg",
+            include_bytes!("../../../testcases/images/tour-eiffel.jpg"),
+        );
+
+        let report = validate_core_directory(root.path());
+
+        assert!(report.is_valid(), "{report:#?}");
+    }
+
+    #[test]
     fn validates_minimal_epc_zip() {
         let root = TestDir::new();
         write_minimal_capsule(root.path(), "escale:00000000000000000000000000");
@@ -2024,6 +2143,20 @@ mod tests {
     }
 
     fn write_minimal_capsule(root: &Path, card_id: &str) {
+        write_minimal_capsule_with_cover(
+            root,
+            card_id,
+            COVER_PATH,
+            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
+        );
+    }
+
+    fn write_minimal_capsule_with_cover(
+        root: &Path,
+        card_id: &str,
+        cover_path: &str,
+        cover_bytes: &[u8],
+    ) {
         fs::create_dir_all(root.join("media")).unwrap();
         fs::create_dir_all(root.join("text")).unwrap();
         fs::create_dir_all(root.join("proof")).unwrap();
@@ -2044,8 +2177,8 @@ mod tests {
             },
             "content": {
                 "cover": {
-                    "path": "media/cover.jxl",
-                    "mime": "image/jxl"
+                    "path": cover_path,
+                    "mime": cover_mime_for_path(cover_path).unwrap()
                 },
                 "thumbnail": {
                     "path": "media/thumbnail.jxl",
@@ -2065,19 +2198,20 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        write_sample_jxl_files(root);
+        fs::write(root.join(cover_path), cover_bytes).unwrap();
+        write_sample_thumbnail_jxl(root);
         fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
 
-        let entries = epc_core::EXPECTED_HASHED_CORE_FILES
-            .iter()
+        let entries = [MANIFEST_PATH, cover_path, THUMBNAIL_PATH, MESSAGE_PATH]
+            .into_iter()
             .map(|path| {
-                let transform = if *path == MANIFEST_PATH {
+                let transform = if path == MANIFEST_PATH {
                     HashTransform::Jcs
                 } else {
                     HashTransform::Identity
                 };
                 HashEntry {
-                    path: (*path).to_string(),
+                    path: path.to_string(),
                     transform,
                     digest: digest_entry(&root.join(path), transform).unwrap(),
                 }
@@ -2103,15 +2237,10 @@ mod tests {
         .unwrap();
     }
 
-    fn write_sample_jxl_files(root: &Path) {
-        fs::write(
-            root.join(COVER_PATH),
-            include_bytes!("../../../testcases/image/cover.jxl"),
-        )
-        .unwrap();
+    fn write_sample_thumbnail_jxl(root: &Path) {
         fs::write(
             root.join(THUMBNAIL_PATH),
-            include_bytes!("../../../testcases/image/thumbnail.jxl"),
+            include_bytes!("../../../testcases/images/rose.jxl"),
         )
         .unwrap();
     }
@@ -2133,9 +2262,10 @@ mod tests {
             zip.add_directory(directory, directory_options).unwrap();
         }
 
+        let manifest = read_manifest(root, &mut ValidationReport::default()).unwrap();
         for path in [
             MANIFEST_PATH,
-            COVER_PATH,
+            manifest.content.cover.path.as_str(),
             THUMBNAIL_PATH,
             MESSAGE_PATH,
             HASHES_PATH,

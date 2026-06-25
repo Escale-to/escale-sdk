@@ -57,14 +57,30 @@ d'usage et les diagnostics d'échec sont écrits sur `stderr`.
 
 ## Créer un brouillon EPC
 
-La commande `create` initialise un dossier EPC unpacked.
+La commande `create` initialise un dossier EPC unpacked à partir d'un dossier
+préparé ou d'une image de couverture.
 
 ```bash
-escale-epc create drafts/postcard-001 "Alice"
+escale-epc create photo.jpg "Alice" "Bonjour depuis Escale."
 ```
 
-Elle crée les dossiers nécessaires, écrit `manifest.json`, initialise
-`text/message.md` si absent, et supprime les preuves générées obsolètes.
+Avec une image `.jpg`, `.jpeg`, `.png` ou `.jxl`, elle crée un dossier frère nommé
+`escale-TTTTTT-RR`, copie l'image sans modification dans `media/cover.*`, dérive
+`media/thumbnail.jxl`, écrit `manifest.json`, initialise `text/message.md` si
+absent, et supprime les preuves générées obsolètes.
+
+`TTTTTT` correspond au `HHMMSS` local du device encodé en base36 sur six
+caractères ; `RR` est un suffixe court anti-collision.
+
+Avec un dossier, celui-ci doit déjà exister et contenir une image principale
+supportée : `media/cover.jpg`, `media/cover.jpeg`, `media/cover.png` ou
+`media/cover.jxl`.
+
+Si un message optionnel est fourni, il est écrit dans `text/message.md`. Sinon,
+le fichier est créé vide et peut être modifié avant le packing.
+
+Les options d'encodage de `image prepare` sont aussi acceptées quand `create`
+reçoit une image, par exemple `--quality <n>`, `--distance <n>` ou `--effort <n>`.
 
 Le dossier créé est affiché sur `stdout`.
 
@@ -78,11 +94,11 @@ Sans `--force`, la commande refuse d'écraser un manifest existant.
 
 Après création, l'application ou l'utilisateur doit encore fournir :
 
-- une image source pour la couverture ;
-- `text/message.md`
+- `text/message.md`, uniquement si le message n'a pas été fourni à `create`
 
-La commande `image prepare` produit ensuite `media/cover.jxl` et dérive
-automatiquement `media/thumbnail.jxl` à partir de cette couverture.
+La commande `image prepare` reste disponible pour copier une couverture
+supportée sans modification et dériver automatiquement `media/thumbnail.jxl`
+dans un dossier déjà existant.
 
 ## Valider une archive EPC
 
@@ -288,8 +304,8 @@ escale-epc image preview media/cover.jxl --out preview.png --force
 
 ## Encoder une image en JXL
 
-`image encode` convertit un fichier supporté par `cjxl`, typiquement JPEG ou
-PNG, vers JPEG XL, puis valide le résultat comme `cover` ou `thumbnail`.
+`image encode` convertit un JPEG ou PNG vers JPEG XL avec l'encodeur Rust du SDK,
+puis valide le résultat comme `cover` ou `thumbnail`.
 
 ```bash
 escale-epc image encode source.jpg media/cover.jxl --kind cover
@@ -303,10 +319,9 @@ escale-epc image encode source.png media/thumbnail.jxl --kind thumbnail
 
 Options disponibles :
 
-- `--cjxl <path>` : chemin explicite vers l'exécutable `cjxl` ;
 - `--distance <n>` : distance JPEG XL ;
 - `--quality <n>` : qualité JPEG XL ;
-- `--effort <n>` : effort encodeur ;
+- `--effort <n>` : option réservée pour compatibilité CLI ;
 - `--force` : autorise l'écrasement du fichier de sortie.
 
 Exemple lossless explicite :
@@ -314,15 +329,6 @@ Exemple lossless explicite :
 ```bash
 escale-epc image encode source.jpg media/cover.jxl --kind cover --distance 0 --effort 7
 ```
-
-Exemple avec chemin `cjxl` explicite :
-
-```bash
-escale-epc image encode source.jpg media/cover.jxl --kind cover --cjxl /usr/local/bin/cjxl
-```
-
-Si `cjxl` n'est pas disponible dans le `PATH`, installer les outils libjxl ou
-passer `--cjxl <path>`.
 
 ## Préparer les images d'un brouillon
 
@@ -345,13 +351,14 @@ La commande :
 
 La miniature conserve le ratio de la couverture, n'est pas recadrée et n'est
 pas agrandie si la couverture tient déjà dans 1024x1024 pixels.
+Par défaut, elle est encodée en qualité 80 plutôt qu'en lossless afin de rester
+nettement plus légère que la couverture.
 
 Options disponibles :
 
-- `--cjxl <path>` ;
 - `--distance <n>` ;
 - `--quality <n>` ;
-- `--effort <n>` ;
+- `--effort <n>` : option réservée pour compatibilité CLI ;
 - `--force`.
 
 Exemple :
@@ -380,21 +387,17 @@ autres implémentations du format.
 Un flux minimal de création ressemble à ceci :
 
 ```bash
-escale-epc create drafts/postcard-001 "Alice"
-escale-epc image prepare photo.jpg drafts/postcard-001
-printf "Bonjour depuis Escale.\n" > drafts/postcard-001/text/message.md
-escale-epc validate-dir drafts/postcard-001
-escale-epc pack drafts/postcard-001 dist
+draft_dir="$(escale-epc create photo.jpg "Alice" "Bonjour depuis Escale.")"
+escale-epc validate-dir "$draft_dir"
+escale-epc pack "$draft_dir" dist
 ```
 
 Avec signature :
 
 ```bash
-escale-epc create drafts/postcard-001 "Alice"
-escale-epc image prepare photo.jpg drafts/postcard-001
-printf "Bonjour depuis Escale.\n" > drafts/postcard-001/text/message.md
-escale-epc sign --ssh-key keys/author_ed25519 drafts/postcard-001
-escale-epc pack drafts/postcard-001 dist
+draft_dir="$(escale-epc create photo.jpg "Alice" "Bonjour depuis Escale.")"
+escale-epc sign --ssh-key keys/author_ed25519 "$draft_dir"
+escale-epc pack "$draft_dir" dist
 ```
 
 Ou signature intégrée au packing :

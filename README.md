@@ -42,7 +42,7 @@ Available commands:
 ```sh
 cargo run -p epc-cli -- validate <capsule.epc>
 cargo run -p epc-cli -- validate-dir <unpacked-capsule-dir>
-cargo run -p epc-cli -- create [--force] <draft-dir> <author-display-name>
+cargo run -p epc-cli -- create [--force] <draft-dir|cover.jpg|cover.png> <author-display-name> [<message>]
 cargo run -p epc-cli -- image info <image.jxl> [--kind cover|thumbnail]
 cargo run -p epc-cli -- image validate <image.jxl> --kind cover|thumbnail
 cargo run -p epc-cli -- image preview <image.jxl> --out <preview.png> [--max <px>]
@@ -71,9 +71,9 @@ Optional JPEG XL encoding:
 cargo test -p epc-image --features jxl-encode-libjxl
 ```
 
-The `jxl-encode-libjxl` feature delegates encoding to the reference `cjxl`
-binary. It can encode supported input files such as JPEG or PNG, and can encode
-RGBA8 by staging a temporary PNG before invoking `cjxl`.
+The `jxl-encode-libjxl` feature decodes supported input files such as JPEG or
+PNG to RGBA8, then encodes JPEG XL through the libjxl C encoder. It does not
+require the external `cjxl` binary.
 
 ```rust
 let image = epc_image::RgbaImage {
@@ -92,23 +92,31 @@ epc_image::encode_rgba8_to_jxl_file(
 Capsule creation:
 
 ```sh
-cargo run -p epc-cli -- create ../my-card "Bruno"
-cargo run -p epc-cli -- image prepare ../photo.jpg ../my-card
+cargo run -p epc-cli -- create ../photo.jpg "Bruno" "Bonjour depuis Escale."
 ```
 
 This creates:
 
 ```sh
-my-card/
+escale-TTTTTT-RR/
   manifest.json
   media/
+    cover.jxl
+    thumbnail.jxl
   text/
     message.md
 ```
 
-`image prepare` writes `media/cover.jxl` and derives `media/thumbnail.jxl` from
-that cover with a 1024x1024 fit, preserving aspect ratio without cropping or
-upscaling. Edit `text/message.md` before packing.
+When `create` receives a `.jpg`, `.jpeg`, or `.png` file, it creates a sibling
+draft directory named `escale-TTTTTT-RR`, writes `media/cover.jxl`, and derives
+`media/thumbnail.jxl` from that cover with a 1024x1024 fit, preserving aspect
+ratio without cropping or upscaling. `TTTTTT` is the device-local `HHMMSS`
+compressed in base36 on six characters and `RR` is a short anti-collision
+suffix.
+
+When `create` receives a directory, that directory must already exist and
+contain `media/cover.jxl`. When the optional message is provided, `create`
+writes it to `text/message.md`; otherwise edit `text/message.md` before packing.
 
 No need to create `proof/hashes.json` because `pack` generates it
 automatically before writing the `.epc` file.

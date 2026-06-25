@@ -31,8 +31,8 @@ cargo doc -p epc-pack --no-deps --document-private-items
 Le flux normal de création d'un EPC est :
 
 1. Créer un dossier de brouillon avec `create_draft_directory`.
-2. Produire `media/cover.jxl` depuis l'image source.
-3. Dériver `media/thumbnail.jxl` depuis `media/cover.jxl` avec la règle EPC.
+2. Copier l'image source acceptée sans modification dans `media/cover.*`.
+3. Dériver `media/thumbnail.jxl` depuis cette couverture avec la règle EPC.
 4. Ajouter ou modifier `text/message.md`.
 5. Signer le dossier si une preuve d'authenticité est souhaitée.
 6. Packer le dossier en `.epc`.

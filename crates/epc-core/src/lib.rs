@@ -43,8 +43,16 @@ pub const INTEGRITY_VERSION_1: &str = "1";
 /// Required manifest path at the capsule root.
 pub const MANIFEST_PATH: &str = "manifest.json";
 
-/// Required JPEG XL cover image path.
+/// Preferred JPEG XL cover image path.
 pub const COVER_PATH: &str = "media/cover.jxl";
+
+/// Supported cover image paths for EPC 1.0 `core-format`.
+pub const SUPPORTED_COVER_PATHS: [&str; 4] = [
+    "media/cover.jpg",
+    "media/cover.jpeg",
+    "media/cover.png",
+    "media/cover.jxl",
+];
 
 /// Required JPEG XL thumbnail image path.
 pub const THUMBNAIL_PATH: &str = "media/thumbnail.jxl";
@@ -112,7 +120,7 @@ pub const MAX_SIGNATURE_SIZE: u64 = 64 * 1024;
 /// Maximum `text/message.md` size in bytes.
 pub const MAX_MESSAGE_SIZE: u64 = 64 * 1024;
 
-/// Maximum `media/cover.jxl` file size in bytes.
+/// Maximum cover image file size in bytes.
 pub const MAX_COVER_SIZE: u64 = 24 * 1024 * 1024;
 
 /// Maximum `media/thumbnail.jxl` file size in bytes.
@@ -206,6 +214,41 @@ pub struct MediaContent {
 
     /// Explicit MIME type.
     pub mime: String,
+
+    /// Optional still-image metadata captured from the referenced media file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageMetadata>,
+}
+
+/// Still-image metadata captured in the manifest for a media file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageMetadata {
+    /// Image width in pixels.
+    pub width: u32,
+
+    /// Image height in pixels.
+    pub height: u32,
+
+    /// Total pixel count.
+    pub pixels: u64,
+
+    /// Human-readable image format name, such as `JPEG XL`, `JPEG`, or `PNG`.
+    pub format: String,
+
+    /// Technical image encoding name, such as `jpeg-xl`, `jpeg`, or `png`.
+    pub encoding: String,
+
+    /// Bits used for each color sample.
+    pub bits_per_sample: u32,
+
+    /// Number of color channels declared by the image.
+    pub color_channels: u32,
+
+    /// Number of alpha bits declared by the image.
+    pub alpha_bits: u32,
+
+    /// Total declared bits per pixel.
+    pub bits_per_pixel: u32,
 }
 
 /// Manifest declaration for the Markdown message file.
@@ -410,18 +453,18 @@ pub fn is_safe_core_path(path: &str) -> bool {
 pub fn expected_file_size_limit(path: &str) -> Option<u64> {
     match path {
         MANIFEST_PATH => Some(MAX_MANIFEST_SIZE),
-        COVER_PATH => Some(MAX_COVER_SIZE),
         THUMBNAIL_PATH => Some(MAX_THUMBNAIL_SIZE),
         MESSAGE_PATH => Some(MAX_MESSAGE_SIZE),
         HASHES_PATH => Some(MAX_HASHES_SIZE),
         SIGNATURE_PATH => Some(MAX_SIGNATURE_SIZE),
+        _ if is_supported_cover_path(path) => Some(MAX_COVER_SIZE),
         _ => None,
     }
 }
 
 /// Returns `true` when `path` is one of the five required regular files.
 pub fn is_expected_core_file(path: &str) -> bool {
-    EXPECTED_CORE_FILES.contains(&path)
+    EXPECTED_CORE_FILES.contains(&path) || is_supported_cover_path(path)
 }
 
 /// Returns `true` when `path` is a regular file allowed by `core-format`.
@@ -431,5 +474,20 @@ pub fn is_allowed_regular_file(path: &str) -> bool {
 
 /// Returns `true` when `path` must be covered by `proof/hashes.json`.
 pub fn is_expected_hashed_core_file(path: &str) -> bool {
-    EXPECTED_HASHED_CORE_FILES.contains(&path)
+    EXPECTED_HASHED_CORE_FILES.contains(&path) || is_supported_cover_path(path)
+}
+
+/// Returns `true` when `path` is an accepted immutable cover image path.
+pub fn is_supported_cover_path(path: &str) -> bool {
+    SUPPORTED_COVER_PATHS.contains(&path)
+}
+
+/// Returns the MIME type expected for a supported cover image path.
+pub fn cover_mime_for_path(path: &str) -> Option<&'static str> {
+    match path {
+        "media/cover.jpg" | "media/cover.jpeg" => Some("image/jpeg"),
+        "media/cover.png" => Some("image/png"),
+        "media/cover.jxl" => Some("image/jxl"),
+        _ => None,
+    }
 }

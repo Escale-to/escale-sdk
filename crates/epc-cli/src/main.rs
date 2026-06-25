@@ -1,7 +1,12 @@
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static DRAFT_DIR_RANDOM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -63,41 +68,60 @@ fn main() -> ExitCode {
         }
         Some("create") => {
             let mut force = false;
+            let mut options = epc_image::EncodeOptions::default();
             let mut values = Vec::new();
-            for arg in args {
-                if arg == "--force" {
-                    force = true;
-                } else {
-                    values.push(arg);
+            let mut iter = args;
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--force" => force = true,
+                    "--distance" => {
+                        let Some(value) = iter.next() else {
+                            eprintln!("--distance requires a number");
+                            return ExitCode::from(2);
+                        };
+                        let Ok(value) = value.parse::<f32>() else {
+                            eprintln!("--distance requires a number");
+                            return ExitCode::from(2);
+                        };
+                        options = options.with_distance(value);
+                    }
+                    "--quality" => {
+                        let Some(value) = iter.next() else {
+                            eprintln!("--quality requires a number");
+                            return ExitCode::from(2);
+                        };
+                        let Ok(value) = value.parse::<f32>() else {
+                            eprintln!("--quality requires a number");
+                            return ExitCode::from(2);
+                        };
+                        options = options.with_quality(value);
+                    }
+                    "--effort" => {
+                        let Some(value) = iter.next() else {
+                            eprintln!("--effort requires an integer");
+                            return ExitCode::from(2);
+                        };
+                        let Ok(value) = value.parse::<u8>() else {
+                            eprintln!("--effort requires an integer");
+                            return ExitCode::from(2);
+                        };
+                        options = options.with_effort(value);
+                    }
+                    _ => values.push(arg),
                 }
             }
-            if values.len() != 2 {
-                eprintln!("usage: escale-epc create [--force] <draft-dir> <author-display-name>");
+            if !(2..=3).contains(&values.len()) {
+                eprintln!("usage: escale-epc create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.jxl> <author-display-name> [<message>] [--distance <n>|--quality <n>] [--effort <n>]");
                 return ExitCode::from(2);
             }
 
-            let request =
-                epc_pack::CreateDraftRequest::new(&values[0], &values[1]).with_force(force);
-            match epc_pack::create_draft_directory(request) {
-                Ok(draft_dir) => {
-                    println!("{}", draft_dir.display());
-                    ExitCode::SUCCESS
-                }
-                Err(epc_pack::PackError::Io(error)) => {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        eprintln!(
-                            "failed to create draft: manifest.json already exists; refusing to overwrite an existing draft"
-                        );
-                    } else {
-                        eprintln!("failed to create draft: {error}");
-                    }
-                    ExitCode::from(2)
-                }
-                Err(error) => {
-                    eprintln!("failed to create draft: {error:?}");
-                    ExitCode::from(2)
-                }
-            }
+            create_draft(
+                &values[0],
+                &values[1],
+                values.get(2).map(String::as_str),
+                force,
+                &options,
+            )
         }
         Some("pack") => {
             let mut signing_key = None;
@@ -259,8 +283,8 @@ fn print_help() {
     println!("escale-epc {}", epc_core::EPC_VERSION_1_0);
     println!();
     println!("commands:");
-    println!("  create [--force] <draft-dir> <author>");
-    println!("                                      Create or reset an unpacked EPC draft");
+    println!("  create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.jxl> <author> [message]");
+    println!("                                      Create or reset an EPC draft from a prepared dir or cover image");
     println!("  validate <capsule.epc>               Validate a core-format EPC archive");
     println!("  validate-dir <unpacked-capsule-dir>  Validate an unpacked core-format capsule");
     println!("  pack [--sign <ssh-key>] [--force] <source-dir> [output-dir]");
@@ -270,6 +294,263 @@ fn print_help() {
     println!("  image <command> ...                  Inspect, preview, encode, or prepare JXL");
     println!("  generate-test-vectors <dir>          Generate core-format conformance vectors");
     println!("  --version                            Print the EPC version");
+}
+
+fn create_draft(
+    input: &str,
+    author_display_name: &str,
+    message: Option<&str>,
+    force: bool,
+    options: &epc_image::EncodeOptions,
+) -> ExitCode {
+    let input = PathBuf::from(input);
+    if is_supported_create_image(&input) {
+        return create_draft_from_image(&input, author_display_name, message, force, options);
+    }
+
+    if !input.exists() {
+        eprintln!("draft directory does not exist: {}", input.display());
+        return ExitCode::from(2);
+    }
+    if !input.is_dir() {
+        eprintln!(
+            "create expects an existing draft directory or a .jpg/.jpeg/.png/.jxl cover image: {}",
+            input.display()
+        );
+        return ExitCode::from(2);
+    }
+
+    let cover_path = supported_cover_paths()
+        .iter()
+        .map(|path| input.join(path))
+        .zip(supported_cover_paths())
+        .find_map(|(full_path, cover_path)| full_path.is_file().then_some(cover_path));
+    let Some(cover_path) = cover_path else {
+        eprintln!("draft directory is missing a supported media/cover image");
+        return ExitCode::from(2);
+    };
+
+    let request = epc_pack::CreateDraftRequest::new(&input, author_display_name)
+        .with_force(force)
+        .with_cover_path(cover_path);
+    finish_create_draft(request, message)
+}
+
+fn create_draft_from_image(
+    input: &Path,
+    author_display_name: &str,
+    message: Option<&str>,
+    force: bool,
+    options: &epc_image::EncodeOptions,
+) -> ExitCode {
+    if !input.is_file() {
+        eprintln!("cover image does not exist: {}", input.display());
+        return ExitCode::from(2);
+    }
+
+    let draft_dir = match default_image_draft_dir(input) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("failed to choose draft directory: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let cover_path = match cover_path_for_input(input) {
+        Some(path) => path,
+        None => {
+            eprintln!("unsupported cover image extension: {}", input.display());
+            return ExitCode::from(2);
+        }
+    };
+    let request = epc_pack::CreateDraftRequest::new(&draft_dir, author_display_name)
+        .with_force(force)
+        .with_cover_path(cover_path);
+
+    match epc_pack::create_draft_directory(request) {
+        Ok(draft_dir) => {
+            if let Err(error) = prepare_cover_image(input, &draft_dir, force, options) {
+                let cleanup_error = fs::remove_dir_all(&draft_dir).err();
+                eprintln!("{error}");
+                if let Some(cleanup_error) = cleanup_error {
+                    eprintln!(
+                        "failed to remove incomplete draft {}: {cleanup_error}",
+                        draft_dir.display()
+                    );
+                }
+                return ExitCode::from(2);
+            }
+            if let Err(error) = write_optional_message(&draft_dir, message) {
+                let cleanup_error = fs::remove_dir_all(&draft_dir).err();
+                eprintln!("{error}");
+                if let Some(cleanup_error) = cleanup_error {
+                    eprintln!(
+                        "failed to remove incomplete draft {}: {cleanup_error}",
+                        draft_dir.display()
+                    );
+                }
+                return ExitCode::from(2);
+            }
+            println!("{}", draft_dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_create_draft_error(error),
+    }
+}
+
+fn finish_create_draft(request: epc_pack::CreateDraftRequest, message: Option<&str>) -> ExitCode {
+    match epc_pack::create_draft_directory(request) {
+        Ok(draft_dir) => {
+            if let Err(error) = write_optional_message(&draft_dir, message) {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+            println!("{}", draft_dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_create_draft_error(error),
+    }
+}
+
+fn report_create_draft_error(error: epc_pack::PackError) -> ExitCode {
+    match error {
+        epc_pack::PackError::Io(error) => {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                eprintln!(
+                    "failed to create draft: manifest.json already exists; refusing to overwrite an existing draft"
+                );
+            } else {
+                eprintln!("failed to create draft: {error}");
+            }
+            ExitCode::from(2)
+        }
+        error => {
+            eprintln!("failed to create draft: {error:?}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn write_optional_message(draft_dir: &Path, message: Option<&str>) -> Result<(), String> {
+    let Some(message) = message else {
+        return Ok(());
+    };
+
+    fs::write(draft_dir.join(epc_core::MESSAGE_PATH), message)
+        .map_err(|error| format!("failed to write message.md: {error}"))
+}
+
+fn is_supported_create_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            extension.eq_ignore_ascii_case("jpg")
+                || extension.eq_ignore_ascii_case("jpeg")
+                || extension.eq_ignore_ascii_case("png")
+                || extension.eq_ignore_ascii_case("jxl")
+        })
+        .unwrap_or(false)
+}
+
+fn cover_path_for_input(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("jpg") {
+        Some("media/cover.jpg".to_string())
+    } else if extension.eq_ignore_ascii_case("jpeg") {
+        Some("media/cover.jpeg".to_string())
+    } else if extension.eq_ignore_ascii_case("png") {
+        Some("media/cover.png".to_string())
+    } else if extension.eq_ignore_ascii_case("jxl") {
+        Some(epc_core::COVER_PATH.to_string())
+    } else {
+        None
+    }
+}
+
+fn supported_cover_paths() -> [&'static str; 4] {
+    [
+        "media/cover.jpg",
+        "media/cover.jpeg",
+        "media/cover.png",
+        epc_core::COVER_PATH,
+    ]
+}
+
+fn default_image_draft_dir(input: &Path) -> Result<PathBuf, String> {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    for _ in 0..16 {
+        let candidate = parent.join(generated_draft_dir_name()?);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("could not find an unused escale-TTTTTT-RR directory name".to_string())
+}
+
+fn generated_draft_dir_name() -> Result<String, String> {
+    let time = current_time_code()?;
+    let random = random_base36_code(2)?;
+    Ok(format!("escale-{time}-{random}"))
+}
+
+fn current_time_code() -> Result<String, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock must not be before the Unix epoch".to_string())?;
+    let offset_millis = device_utc_offset_millis();
+    let utc_seconds = now.as_secs() as i128;
+    let offset_seconds = offset_millis / 1000;
+    let seconds_per_day = 86_400_i128;
+    let local_seconds = (utc_seconds + offset_seconds).rem_euclid(seconds_per_day);
+    Ok(base36_fixed(local_seconds as u64, 6))
+}
+
+fn device_utc_offset_millis() -> i128 {
+    let local_time = epc_pack::detect_device_created_local_time();
+    parse_utc_offset_millis(&local_time.utc_offset).unwrap_or(0)
+}
+
+fn parse_utc_offset_millis(value: &str) -> Option<i128> {
+    let sign = match value.as_bytes().first().copied()? {
+        b'+' => 1_i128,
+        b'-' => -1_i128,
+        _ => return None,
+    };
+    let (hours, minutes) = value.get(1..)?.split_once(':')?;
+    let hours = hours.parse::<i128>().ok()?;
+    let minutes = minutes.parse::<i128>().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * ((hours * 60 + minutes) * 60 * 1000))
+}
+
+fn random_base36_code(width: usize) -> Result<String, String> {
+    let mut bytes = [0_u8; 2];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_err()
+    {
+        let counter = DRAFT_DIR_RANDOM_COUNTER.fetch_add(1, Ordering::Relaxed) as u16;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock must not be before the Unix epoch".to_string())?
+            .subsec_nanos() as u16;
+        bytes = (counter ^ nanos).to_be_bytes();
+    }
+
+    let space = 36_u64.pow(width as u32);
+    let value = u16::from_be_bytes(bytes) as u64 % space;
+    Ok(base36_fixed(value, width))
+}
+
+fn base36_fixed(mut value: u64, width: usize) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut output = vec![b'0'; width];
+    for slot in output.iter_mut().rev() {
+        *slot = ALPHABET[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8(output).expect("base36 alphabet is valid UTF-8")
 }
 
 fn default_pack_output_dir(source_dir: &str) -> PathBuf {
@@ -308,8 +589,8 @@ fn print_image_help() {
     eprintln!("  image info <image.jxl> [--kind cover|thumbnail]");
     eprintln!("  image validate <image.jxl> --kind cover|thumbnail");
     eprintln!("  image preview <image.jxl> --out <preview.png> [--max <px>] [--kind cover|thumbnail] [--force]");
-    eprintln!("  image encode <input.jpg|png> <output.jxl> --kind cover|thumbnail [--cjxl <path>] [--distance <n>|--quality <n>] [--effort <n>] [--force]");
-    eprintln!("  image prepare <input.jpg|png> <draft-dir> [--cjxl <path>] [--distance <n>|--quality <n>] [--effort <n>] [--force]");
+    eprintln!("  image encode <input.jpg|png> <output.jxl> --kind cover|thumbnail [--distance <n>|--quality <n>] [--effort <n>] [--force]");
+    eprintln!("  image prepare <input.jpg|jpeg|png|jxl> <draft-dir> [--distance <n>|--quality <n>] [--effort <n>] [--force]");
 }
 
 fn image_info(args: Vec<String>) -> ExitCode {
@@ -505,13 +786,6 @@ fn image_encode(args: Vec<String>) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
-            "--cjxl" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("--cjxl requires a path");
-                    return ExitCode::from(2);
-                };
-                options = options.with_cjxl_path(value);
-            }
             "--distance" => {
                 let Some(value) = iter.next() else {
                     eprintln!("--distance requires a number");
@@ -581,13 +855,6 @@ fn image_prepare(args: Vec<String>) -> ExitCode {
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--cjxl" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("--cjxl requires a path");
-                    return ExitCode::from(2);
-                };
-                options = options.with_cjxl_path(value);
-            }
             "--distance" => {
                 let Some(value) = iter.next() else {
                     eprintln!("--distance requires a number");
@@ -627,45 +894,57 @@ fn image_prepare(args: Vec<String>) -> ExitCode {
     }
 
     if values.len() != 2 {
-        eprintln!("usage: escale-epc image prepare <input.jpg|png> <draft-dir> [--force]");
+        eprintln!("usage: escale-epc image prepare <input.jpg|jpeg|png|jxl> <draft-dir> [--force]");
         return ExitCode::from(2);
     }
 
     let input = PathBuf::from(&values[0]);
     let draft = PathBuf::from(&values[1]);
-    let media_dir = draft.join("media");
-    if let Err(error) = fs::create_dir_all(&media_dir) {
-        eprintln!("failed to create media directory: {error}");
-        return ExitCode::from(2);
-    }
-    let cover = draft.join(epc_core::COVER_PATH);
-    let thumbnail = draft.join(epc_core::THUMBNAIL_PATH);
-    if !force && (cover.exists() || thumbnail.exists()) {
-        eprintln!("cover or thumbnail already exists; use --force");
-        return ExitCode::from(2);
-    }
-
-    if let Err(error) =
-        encode_and_validate_file(&input, &cover, epc_image::EpcImageKind::Cover, &options)
-    {
-        eprintln!("{error}");
-        return ExitCode::from(2);
-    }
-
-    match epc_image::encode_thumbnail_from_cover_jxl_file(&cover, &thumbnail, &options) {
+    match prepare_cover_image(&input, &draft, force, &options) {
         Ok(()) => {
-            println!("{}", cover.display());
-            println!("{}", thumbnail.display());
+            let cover_path =
+                cover_path_for_input(&input).unwrap_or_else(|| epc_core::COVER_PATH.to_string());
+            println!("{}", draft.join(cover_path).display());
+            println!("{}", draft.join(epc_core::THUMBNAIL_PATH).display());
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!(
-                "failed to create thumbnail: {}",
-                format_thumbnail_error(error)
-            );
+            eprintln!("{error}");
             ExitCode::from(2)
         }
     }
+}
+
+fn prepare_cover_image(
+    input: &Path,
+    draft: &Path,
+    force: bool,
+    options: &epc_image::EncodeOptions,
+) -> Result<(), String> {
+    let media_dir = draft.join("media");
+    if let Err(error) = fs::create_dir_all(&media_dir) {
+        return Err(format!("failed to create media directory: {error}"));
+    }
+    let cover_path = cover_path_for_input(input)
+        .ok_or_else(|| format!("unsupported cover image extension: {}", input.display()))?;
+    let cover = draft.join(&cover_path);
+    let thumbnail = draft.join(epc_core::THUMBNAIL_PATH);
+    if !force && (cover.exists() || thumbnail.exists()) {
+        return Err("cover or thumbnail already exists; use --force".to_string());
+    }
+
+    fs::copy(input, &cover)
+        .map_err(|error| format!("failed to copy cover without modification: {error}"))?;
+
+    epc_image::encode_thumbnail_from_cover_file(&cover, &thumbnail, options).map_err(|error| {
+        format!(
+            "failed to create thumbnail: {}",
+            format_thumbnail_error(error)
+        )
+    })?;
+
+    epc_pack::refresh_manifest_image_metadata(draft)
+        .map_err(|error| format!("failed to update manifest image metadata: {error:?}"))
 }
 
 fn encode_and_validate_file(
@@ -693,12 +972,6 @@ fn encode_and_validate_file(
 
 fn format_encode_error(error: epc_image::EncodeError) -> String {
     match error {
-        epc_image::EncodeError::CjxlUnavailable { path, source } => {
-            format!(
-                "cannot start cjxl at {:?}: {source}. Install libjxl tools or pass --cjxl <path>.",
-                path
-            )
-        }
         other => format!("{other:?}"),
     }
 }
@@ -728,5 +1001,41 @@ fn image_kind_name(kind: epc_image::EpcImageKind) -> &'static str {
     match kind {
         epc_image::EpcImageKind::Cover => "cover",
         epc_image::EpcImageKind::Thumbnail => "thumbnail",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base36_fixed_pads_and_encodes_time_range() {
+        assert_eq!(base36_fixed(0, 6), "000000");
+        assert_eq!(base36_fixed(35, 2), "0Z");
+        assert_eq!(base36_fixed(86_399, 6), "001UNZ");
+    }
+
+    #[test]
+    fn generated_draft_dir_name_uses_time_and_random_groups() {
+        let name = generated_draft_dir_name().unwrap();
+        assert_eq!(name.len(), "escale-000000-00".len());
+        assert!(name.starts_with("escale-"));
+        assert_eq!(name.as_bytes()[13], b'-');
+    }
+
+    #[test]
+    fn parses_normalized_utc_offsets() {
+        assert_eq!(parse_utc_offset_millis("+02:30"), Some(9_000_000));
+        assert_eq!(parse_utc_offset_millis("-01:15"), Some(-4_500_000));
+        assert_eq!(parse_utc_offset_millis("+24:00"), None);
+        assert_eq!(parse_utc_offset_millis("+02"), None);
+    }
+
+    #[test]
+    fn detects_supported_create_images_case_insensitively() {
+        assert!(is_supported_create_image(Path::new("cover.JPG")));
+        assert!(is_supported_create_image(Path::new("cover.jpeg")));
+        assert!(is_supported_create_image(Path::new("cover.PNG")));
+        assert!(is_supported_create_image(Path::new("cover.jxl")));
     }
 }

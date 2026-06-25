@@ -6,10 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-jxl-encode-libjxl = ["dep:png"]
+jxl-encode-libjxl = ["dep:image", "dep:png"]
 
 [dependencies]
 epc-core.workspace = true
-jxl-oxide.workspace = true
+jxl.workspace = true
+image = { workspace = true, optional = true }
 png = { workspace = true, optional = true }
 zip.workspace = true
+
+[build-dependencies]
+pkg-config.workspace = true

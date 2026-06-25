@@ -292,8 +292,8 @@ manifest, des preuves ou des hashes reste du ressort des autres crates du SDK.
 L'API d'encodage est disponible uniquement avec la feature Cargo
 `jxl-encode-libjxl`.
 
-Elle s'appuie sur l'exécutable `cjxl` fourni par libjxl. L'objectif est de ne pas
-réimplémenter l'encodage JPEG XL dans le SDK Rust.
+Elle décode les JPEG et PNG en RGBA8, puis encode JPEG XL avec l'encodeur C
+libjxl. Aucun exécutable `cjxl` externe n'est requis.
 
 Exemple de compilation :
 
@@ -309,18 +309,8 @@ Les options d'encodage sont portées par `EncodeOptions`.
 use epc_image::EncodeOptions;
 
 let options = EncodeOptions::default()
-    .with_distance(0.0)
+    .with_distance(1.0)
     .with_effort(7);
-```
-
-Par défaut, le SDK cherche `cjxl` dans le `PATH`. Pour fournir un chemin
-explicite :
-
-```rust
-use epc_image::EncodeOptions;
-
-let options = EncodeOptions::default()
-    .with_cjxl_path("/usr/local/bin/cjxl");
 ```
 
 Pour piloter l'encodage avec une qualité plutôt qu'une distance :
@@ -334,6 +324,12 @@ let options = EncodeOptions::default()
 ```
 
 `with_quality` désactive la distance configurée auparavant.
+
+Pour les miniatures générées depuis une couverture, `EncodeOptions::default()`
+est automatiquement adapté : si aucune qualité ni distance non nulle n'est
+fournie, la miniature est encodée en qualité 80 plutôt qu'en lossless. Cela évite
+qu'une miniature issue de pixels RGBA soit plus lourde que la couverture JPEG XL
+d'origine.
 
 ### Encoder un JPEG ou un PNG
 
@@ -355,7 +351,7 @@ let options = EncodeOptions::default();
 encode_png_file_to_jxl_file("cover.png", "media/cover.jxl", &options)?;
 ```
 
-Pour laisser `cjxl` gérer un type de fichier supporté :
+Pour encoder un fichier source supporté :
 
 ```rust
 use epc_image::{encode_file_to_jxl_file, EncodeOptions};
@@ -404,8 +400,7 @@ let options = EncodeOptions::default();
 let bytes = encode_rgba8_to_jxl_bytes(&image, &options)?;
 ```
 
-En interne, l'encodage RGBA8 passe par un PNG temporaire afin de fournir une
-source lossless à `cjxl`.
+En interne, l'encodage RGBA8 est transmis directement à l'encodeur Rust JXL.
 
 ### Écrire un PNG depuis RGBA8
 
@@ -459,9 +454,9 @@ Les cas importants sont :
 - `Io` : erreur de fichier ou de processus ;
 - `InvalidRgba` : le buffer RGBA8 n'a pas la taille attendue ;
 - `InvalidOptions` : les options d'encodage sont invalides ;
-- `Png` : l'écriture du PNG temporaire a échoué ;
-- `CjxlFailed` : `cjxl` a démarré mais a échoué ;
-- `CjxlUnavailable` : l'exécutable `cjxl` n'a pas pu être lancé.
+- `DecodeImage` : le JPEG ou PNG source n'a pas pu être décodé ;
+- `JxlEncode` : l'encodage JPEG XL a échoué ;
+- `Png` : l'écriture PNG de debug ou preview a échoué.
 
 ## Choisir la bonne fonction
 
@@ -478,7 +473,7 @@ utiliser `render_cover_from_directory_rgba8` ou
 Pour afficher une couverture ou une miniature depuis une archive `.epc`, utiliser
 `render_cover_from_epc_rgba8` ou `render_thumbnail_from_epc_rgba8`.
 
-Pour encoder un JPEG ou PNG en JXL avec libjxl, activer `jxl-encode-libjxl` et
+Pour encoder un JPEG ou PNG en JXL, activer `jxl-encode-libjxl` et
 utiliser `encode_jpeg_file_to_jxl_file`, `encode_png_file_to_jxl_file` ou
 `encode_file_to_jxl_file`.
 

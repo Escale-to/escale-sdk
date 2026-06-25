@@ -8,7 +8,7 @@
 //! - decode `media/cover.jxl` or `media/thumbnail.jxl` into RGBA8 pixels;
 //! - resize decoded images for display while preserving aspect ratio;
 //! - derive the canonical EPC thumbnail from a cover image;
-//! - optionally encode JPEG, PNG, or RGBA8 inputs to JPEG XL through `cjxl`.
+//! - optionally encode JPEG, PNG, or RGBA8 inputs to JPEG XL through libjxl.
 //!
 //! The public display format is [`RgbaImage`]: interleaved 8-bit RGBA pixels in
 //! row-major order, with dimensions already adjusted for JPEG XL orientation.
@@ -66,11 +66,9 @@
 //!
 //! # JPEG XL encoding
 //!
-//! Encoding is available only with the `jxl-encode-libjxl` Cargo feature. The
-//! feature keeps the Rust core small by delegating actual JPEG XL encoding to
-//! the reference `cjxl` executable from libjxl. Applications that need writing
-//! support should ensure `cjxl` is installed or pass an explicit executable path
-//! in `EncodeOptions`.
+//! Encoding is available only with the `jxl-encode-libjxl` Cargo feature. JPEG
+//! and PNG inputs are decoded to RGBA8 pixels, then encoded as JPEG XL with the
+//! libjxl C encoder. No external `cjxl` process is required.
 //!
 //! # Generating docs
 //!
@@ -87,26 +85,21 @@
 //! cargo doc -p epc-image --no-deps --document-private-items
 //! ```
 
-#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::fs::File;
-use std::io::{self, BufReader, Cursor, Read};
+use std::io::{self, Read};
 use std::path::Path;
 
 use epc_core::{
-    COVER_PATH, MAX_COVER_DIMENSION, MAX_COVER_PIXELS, MAX_THUMBNAIL_DIMENSION,
+    ImageMetadata, COVER_PATH, MAX_COVER_DIMENSION, MAX_COVER_PIXELS, MAX_THUMBNAIL_DIMENSION,
     MAX_THUMBNAIL_PIXELS, THUMBNAIL_PATH,
 };
-use jxl_oxide::JxlImage;
+use jxl::api::{
+    states, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
+    JxlPixelFormat, ProcessingResult,
+};
 use zip::ZipArchive;
-
-#[cfg(feature = "jxl-encode-libjxl")]
-use std::ffi::OsString;
-#[cfg(feature = "jxl-encode-libjxl")]
-use std::process::Command;
-#[cfg(feature = "jxl-encode-libjxl")]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Decoded JPEG XL image metadata used by EPC validators.
 ///
@@ -122,6 +115,22 @@ pub struct JxlInfo {
 
     /// Number of decoded pixels.
     pub pixels: u64,
+}
+
+/// Error returned while reading image metadata.
+#[derive(Debug)]
+pub enum ImageMetadataError {
+    /// The source cannot be read.
+    Io(io::Error),
+
+    /// The image format is not supported by EPC media metadata.
+    UnsupportedFormat,
+
+    /// The image header is malformed or incomplete.
+    InvalidHeader(String),
+
+    /// JPEG XL header parsing failed.
+    Jxl(JxlValidationError),
 }
 
 /// RGBA8 image returned by EPC display APIs.
@@ -338,22 +347,17 @@ pub enum DisplayError {
     InvalidOptions(&'static str),
 }
 
-/// Options for JPEG XL encoding through the reference `cjxl` tool.
+/// Options for JPEG XL encoding.
 ///
 /// This type is available only with the `jxl-encode-libjxl` Cargo feature. The
-/// default favors lossless output (`distance = 0`) with a moderate encoder
-/// effort. Applications can choose either distance-oriented or quality-oriented
-/// options depending on the UX they expose.
+/// default favors visually lossless output (`distance = 1`) for imported JPEG
+/// and PNG files. Applications can choose either distance-oriented or
+/// quality-oriented options depending on the UX they expose.
 #[cfg(feature = "jxl-encode-libjxl")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodeOptions {
-    /// Path or executable name for `cjxl`.
-    ///
-    /// The default is `cjxl`, resolved through the process `PATH`.
-    pub cjxl_path: OsString,
-
-    /// Optional JPEG XL distance. `0.0` requests mathematically lossless output
-    /// for suitable sources.
+    /// Optional JPEG XL distance. `0.0` requests mathematically lossless pixel
+    /// output; non-zero values use lossy VarDCT encoding.
     pub distance: Option<f32>,
 
     /// Optional JPEG XL quality value.
@@ -370,11 +374,10 @@ pub struct EncodeOptions {
 
 #[cfg(feature = "jxl-encode-libjxl")]
 impl Default for EncodeOptions {
-    /// Builds lossless-oriented `cjxl` encoding options.
+    /// Builds visually lossless-oriented JPEG XL encoding options.
     fn default() -> Self {
         Self {
-            cjxl_path: OsString::from("cjxl"),
-            distance: Some(0.0),
+            distance: Some(1.0),
             quality: None,
             effort: Some(7),
         }
@@ -383,15 +386,9 @@ impl Default for EncodeOptions {
 
 #[cfg(feature = "jxl-encode-libjxl")]
 impl EncodeOptions {
-    /// Sets the `cjxl` executable path.
-    pub fn with_cjxl_path(mut self, path: impl Into<OsString>) -> Self {
-        self.cjxl_path = path.into();
-        self
-    }
-
     /// Sets the JPEG XL distance.
     ///
-    /// `0.0` requests mathematically lossless output for suitable sources.
+    /// `0.0` requests mathematically lossless pixel output.
     pub fn with_distance(mut self, distance: f32) -> Self {
         self.distance = Some(distance);
         self
@@ -408,6 +405,25 @@ impl EncodeOptions {
     pub fn with_effort(mut self, effort: u8) -> Self {
         self.effort = Some(effort);
         self
+    }
+
+    /// Builds thumbnail-friendly options from the current encoder settings.
+    ///
+    /// The default cover preset is lossless-oriented. Thumbnails are derived
+    /// from decoded RGBA pixels, so lossless re-encoding can be much larger than
+    /// the source cover. When the caller did not choose a quality or non-zero
+    /// distance, use a visually high-quality lossy thumbnail preset instead.
+    pub fn for_thumbnail(&self) -> Self {
+        let mut options = self.clone();
+        let uses_defaultish_distance = match options.distance {
+            None => true,
+            Some(distance) => distance <= 1.0,
+        };
+        if options.quality.is_none() && uses_defaultish_distance {
+            options.quality = Some(80.0);
+            options.distance = None;
+        }
+        options
     }
 }
 
@@ -430,26 +446,14 @@ pub enum EncodeError {
     /// Invalid encoder options were supplied.
     InvalidOptions(&'static str),
 
-    /// PNG staging failed before invoking `cjxl`.
+    /// The source image could not be decoded.
+    DecodeImage(String),
+
+    /// JPEG XL encoding failed.
+    JxlEncode(String),
+
+    /// PNG writing failed.
     Png(String),
-
-    /// `cjxl` exited unsuccessfully.
-    CjxlFailed {
-        /// Process exit status rendered for diagnostics.
-        status: String,
-
-        /// Captured stderr text.
-        stderr: String,
-    },
-
-    /// The configured `cjxl` executable could not be started.
-    CjxlUnavailable {
-        /// Configured executable path.
-        path: OsString,
-
-        /// Underlying I/O error.
-        source: io::Error,
-    },
 }
 
 /// Error returned while deriving and encoding a thumbnail from a cover.
@@ -506,12 +510,34 @@ pub fn validate_jxl_file(
     path: impl AsRef<Path>,
     kind: EpcImageKind,
 ) -> Result<JxlInfo, JxlValidationError> {
-    let file = File::open(path).map_err(JxlValidationError::Io)?;
-    let reader = BufReader::new(file);
-    let image = JxlImage::builder()
-        .read(reader)
-        .map_err(|error| JxlValidationError::InvalidBitstream(error.to_string()))?;
-    validate_jxl_image(image, kind)
+    let bytes = std::fs::read(path).map_err(JxlValidationError::Io)?;
+    decode_jxl_bytes_with_jxl_rs(&bytes, kind)
+        .map(|(info, _)| info)
+        .map_err(display_error_to_validation_error)
+}
+
+/// Reads still-image metadata from a supported EPC media file.
+///
+/// JPEG XL, JPEG, and PNG are supported because these are the image encodings
+/// accepted by the `core-format` manifest for cover or thumbnail resources.
+pub fn read_image_metadata_file(
+    path: impl AsRef<Path>,
+) -> Result<ImageMetadata, ImageMetadataError> {
+    let bytes = std::fs::read(path).map_err(ImageMetadataError::Io)?;
+    read_image_metadata(&bytes)
+}
+
+/// Reads still-image metadata from supported EPC media bytes.
+pub fn read_image_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if is_jxl_bytes(bytes) {
+        read_jxl_metadata(bytes)
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        read_png_metadata(bytes)
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        read_jpeg_metadata(bytes)
+    } else {
+        Err(ImageMetadataError::UnsupportedFormat)
+    }
 }
 
 /// Decodes JPEG XL bytes into RGBA8, optionally resizing for display.
@@ -524,10 +550,8 @@ pub fn decode_jxl_rgba8(
     kind: EpcImageKind,
     options: RenderOptions,
 ) -> Result<RgbaImage, DisplayError> {
-    let image = JxlImage::builder()
-        .read(Cursor::new(bytes))
-        .map_err(|error| JxlValidationError::InvalidBitstream(error.to_string()))?;
-    decode_jxl_image(image, kind, options)
+    let (info, rgba) = decode_jxl_bytes_with_jxl_rs(bytes, kind)?;
+    resize_decoded_rgba8(rgba, info.width, info.height, options)
 }
 
 /// Reads and decodes a JPEG XL file into RGBA8, optionally resizing for display.
@@ -538,12 +562,8 @@ pub fn decode_jxl_file_rgba8(
     kind: EpcImageKind,
     options: RenderOptions,
 ) -> Result<RgbaImage, DisplayError> {
-    let file = File::open(path).map_err(DisplayError::Io)?;
-    let reader = BufReader::new(file);
-    let image = JxlImage::builder()
-        .read(reader)
-        .map_err(|error| JxlValidationError::InvalidBitstream(error.to_string()))?;
-    decode_jxl_image(image, kind, options)
+    let bytes = std::fs::read(path).map_err(DisplayError::Io)?;
+    decode_jxl_rgba8(&bytes, kind, options)
 }
 
 /// Renders `media/cover.jxl` from an unpacked EPC directory as RGBA8.
@@ -669,6 +689,25 @@ pub fn derive_thumbnail_rgba8_from_cover_jxl_file(
     )
 }
 
+/// Reads a supported cover source file and derives canonical EPC thumbnail pixels.
+///
+/// JPEG and PNG inputs are decoded through the `image` crate. JPEG XL inputs are
+/// decoded through the EPC JPEG XL reader. The source file itself is not
+/// modified or re-encoded by this helper.
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn derive_thumbnail_rgba8_from_cover_file(
+    cover_file: impl AsRef<Path>,
+) -> Result<RgbaImage, ThumbnailError> {
+    let cover_file = cover_file.as_ref();
+    let cover = if is_jxl_path(cover_file) {
+        derive_thumbnail_rgba8_from_cover_jxl_file(cover_file)?
+    } else {
+        let image = decode_source_image_rgba8(cover_file)?;
+        derive_thumbnail_rgba8_from_cover(&image)?
+    };
+    Ok(cover)
+}
+
 /// Encodes canonical EPC thumbnail bytes from cover JPEG XL bytes.
 ///
 /// This is the in-memory equivalent of
@@ -679,7 +718,8 @@ pub fn encode_thumbnail_from_cover_jxl_bytes(
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, ThumbnailError> {
     let thumbnail = derive_thumbnail_rgba8_from_cover_jxl(cover_jxl)?;
-    let bytes = encode_rgba8_to_jxl_bytes(&thumbnail, options)?;
+    let thumbnail_options = options.for_thumbnail();
+    let bytes = encode_rgba8_to_jxl_bytes(&thumbnail, &thumbnail_options)?;
     decode_jxl_rgba8(&bytes, EpcImageKind::Thumbnail, RenderOptions::original())?;
     Ok(bytes)
 }
@@ -695,15 +735,33 @@ pub fn encode_thumbnail_from_cover_jxl_file(
     options: &EncodeOptions,
 ) -> Result<(), ThumbnailError> {
     let thumbnail = derive_thumbnail_rgba8_from_cover_jxl_file(cover_file)?;
-    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), options)?;
+    let thumbnail_options = options.for_thumbnail();
+    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
     validate_jxl_file(thumbnail_file, EpcImageKind::Thumbnail)?;
     Ok(())
 }
 
-/// Encodes a JPEG file into JPEG XL using `cjxl`.
+/// Encodes a canonical EPC thumbnail file from a supported cover source file.
 ///
-/// The input is passed directly to `cjxl`; no Rust-side color conversion or
-/// resizing is performed.
+/// The cover source may be JPEG, PNG, or JPEG XL. Only the thumbnail output is
+/// encoded as JPEG XL; the caller remains responsible for storing the cover
+/// source bytes unchanged in the EPC capsule.
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn encode_thumbnail_from_cover_file(
+    cover_file: impl AsRef<Path>,
+    thumbnail_file: impl AsRef<Path>,
+    options: &EncodeOptions,
+) -> Result<(), ThumbnailError> {
+    let thumbnail = derive_thumbnail_rgba8_from_cover_file(cover_file)?;
+    let thumbnail_options = options.for_thumbnail();
+    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
+    validate_jxl_file(thumbnail_file, EpcImageKind::Thumbnail)?;
+    Ok(())
+}
+
+/// Encodes a JPEG file into JPEG XL.
+///
+/// The input is decoded to RGBA8 pixels before JPEG XL encoding.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_jpeg_file_to_jxl_file(
     input_file: impl AsRef<Path>,
@@ -713,10 +771,9 @@ pub fn encode_jpeg_file_to_jxl_file(
     encode_file_to_jxl_file(input_file, output_file, options)
 }
 
-/// Encodes a PNG file into JPEG XL using `cjxl`.
+/// Encodes a PNG file into JPEG XL.
 ///
-/// The input is passed directly to `cjxl`; no Rust-side color conversion or
-/// resizing is performed.
+/// The input is decoded to RGBA8 pixels before JPEG XL encoding.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_png_file_to_jxl_file(
     input_file: impl AsRef<Path>,
@@ -726,7 +783,7 @@ pub fn encode_png_file_to_jxl_file(
     encode_file_to_jxl_file(input_file, output_file, options)
 }
 
-/// Encodes an input image file supported by `cjxl` into JPEG XL.
+/// Encodes an input JPEG or PNG image file into JPEG XL.
 ///
 /// This is the generic file-based encoder entry point. Prefer the typed helper
 /// names in CLI and binding APIs when they make user intent clearer.
@@ -737,25 +794,20 @@ pub fn encode_file_to_jxl_file(
     options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     validate_encode_options(options)?;
-    run_cjxl(input_file.as_ref(), output_file.as_ref(), options)
+    let image = decode_source_image_rgba8(input_file.as_ref())?;
+    let bytes = encode_rgba8_to_jxl_bytes(&image, options)?;
+    std::fs::write(output_file, bytes).map_err(EncodeError::Io)
 }
 
-/// Encodes RGBA8 pixels into a JPEG XL file using a temporary PNG and `cjxl`.
-///
-/// The temporary PNG is an implementation detail used to feed `cjxl` a
-/// lossless, broadly supported input format.
+/// Encodes RGBA8 pixels into a JPEG XL file.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_rgba8_to_jxl_file(
     image: &RgbaImage,
     output_file: impl AsRef<Path>,
     options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
-    validate_rgba_image(image)?;
-    validate_encode_options(options)?;
-
-    let temp_png = TempFile::new("epc-image-rgba", "png")?;
-    write_rgba_png(temp_png.path(), image)?;
-    run_cjxl(temp_png.path(), output_file.as_ref(), options)
+    let bytes = encode_rgba8_to_jxl_bytes(image, options)?;
+    std::fs::write(output_file, bytes).map_err(EncodeError::Io)
 }
 
 /// Encodes RGBA8 pixels into JPEG XL bytes.
@@ -767,9 +819,9 @@ pub fn encode_rgba8_to_jxl_bytes(
     image: &RgbaImage,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, EncodeError> {
-    let temp_jxl = TempFile::new("epc-image-rgba", "jxl")?;
-    encode_rgba8_to_jxl_file(image, temp_jxl.path(), options)?;
-    std::fs::read(temp_jxl.path()).map_err(EncodeError::Io)
+    validate_rgba_image(image)?;
+    validate_encode_options(options)?;
+    libjxl_encoder::encode_rgba8(image, options)
 }
 
 /// Writes RGBA8 pixels to a PNG file.
@@ -785,44 +837,14 @@ pub fn write_rgba_png_file(
     write_rgba_png(output_file.as_ref(), image)
 }
 
-/// Validates an already parsed JPEG XL image.
-///
-/// This shared helper is used by file validation. It checks EPC image limits
-/// and renders the first frame so that malformed payloads fail during
-/// validation rather than later in a viewer.
-fn validate_jxl_image(image: JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValidationError> {
-    let info = image_info(&image, kind)?;
-    image
-        .render_frame(0)
-        .map_err(|error| JxlValidationError::DecodeFailed(error.to_string()))?;
-    Ok(info)
-}
-
-/// Decodes an already parsed JPEG XL image into the SDK RGBA8 display format.
-///
-/// The function centralizes the display pipeline: render first frame, normalize
-/// channels to RGBA8, compute target dimensions, and resize only when needed.
-fn decode_jxl_image(
-    image: JxlImage,
-    kind: EpcImageKind,
+/// Resizes an already decoded RGBA8 image according to render options.
+fn resize_decoded_rgba8(
+    rgba: RgbaImage,
+    width: u32,
+    height: u32,
     options: RenderOptions,
 ) -> Result<RgbaImage, DisplayError> {
     validate_options(options)?;
-    image_info(&image, kind)?;
-
-    let render = image
-        .render_frame(0)
-        .map_err(|error| JxlValidationError::DecodeFailed(error.to_string()))?;
-    let mut stream = render.stream();
-    let width = stream.width();
-    let height = stream.height();
-    let channels = stream.channels();
-    let samples_len = samples_len(width, height, channels).ok_or(DisplayError::ImageTooLarge)?;
-    let mut samples = vec![0_u8; samples_len];
-    let written = stream.write_to_buffer(&mut samples);
-    samples.truncate(written);
-
-    let rgba = samples_to_rgba8(width, height, channels, &samples)?;
     let (target_width, target_height) = target_dimensions(width, height, options)?;
     if target_width == width && target_height == height {
         Ok(rgba)
@@ -831,14 +853,277 @@ fn decode_jxl_image(
     }
 }
 
-/// Extracts oriented JPEG XL dimensions and applies EPC resource limits.
-///
-/// This function performs metadata-only checks. Callers that need proof of full
-/// decodability must render a frame after calling it.
-fn image_info(image: &JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValidationError> {
-    let header = image.image_header();
-    let width = header.width_with_orientation();
-    let height = header.height_with_orientation();
+/// Decodes JPEG XL bytes with `jxl-rs` into RGBA8 pixels.
+fn decode_jxl_bytes_with_jxl_rs(
+    bytes: &[u8],
+    kind: EpcImageKind,
+) -> Result<(JxlInfo, RgbaImage), DisplayError> {
+    let mut input = bytes;
+    let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let mut decoder = advance_to_image_info(decoder, &mut input)?;
+    let basic_info = decoder.basic_info().clone();
+    let width = u32::try_from(basic_info.size.0).map_err(|_| DisplayError::ImageTooLarge)?;
+    let height = u32::try_from(basic_info.size.1).map_err(|_| DisplayError::ImageTooLarge)?;
+    let info = validate_jxl_dimensions(width, height, kind)?;
+
+    decoder.set_pixel_format(JxlPixelFormat {
+        color_type: JxlColorType::Rgba,
+        color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+        extra_channel_format: vec![None; basic_info.extra_channels.len()],
+    });
+
+    let decoder = advance_to_frame_info(decoder, &mut input)?;
+    let pixel_len = rgba_len(width, height).ok_or(DisplayError::ImageTooLarge)?;
+    let mut pixels = vec![0_u8; pixel_len];
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or(DisplayError::ImageTooLarge)?;
+    let mut buffers = [JxlOutputBuffer::new(
+        &mut pixels,
+        height as usize,
+        row_bytes,
+    )];
+    advance_to_frame_done(decoder, &mut input, &mut buffers)?;
+
+    Ok((
+        info,
+        RgbaImage {
+            width,
+            height,
+            pixels,
+        },
+    ))
+}
+
+fn read_jxl_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    let mut input = bytes;
+    let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let decoder = advance_to_image_info(decoder, &mut input).map_err(|error| match error {
+        DisplayError::Jxl(error) => ImageMetadataError::Jxl(error),
+        other => ImageMetadataError::InvalidHeader(format!("{other:?}")),
+    })?;
+    let basic_info = decoder.basic_info();
+    let width = u32::try_from(basic_info.size.0)
+        .map_err(|_| ImageMetadataError::InvalidHeader("image width is too large".to_string()))?;
+    let height = u32::try_from(basic_info.size.1)
+        .map_err(|_| ImageMetadataError::InvalidHeader("image height is too large".to_string()))?;
+    let bits_per_sample = basic_info.bit_depth.bits_per_sample();
+    let color_channels = 3;
+    let alpha_bits = if basic_info.extra_channels.is_empty() {
+        0
+    } else {
+        bits_per_sample
+    };
+    let bits_per_pixel = bits_per_sample
+        .saturating_mul(color_channels)
+        .saturating_add(alpha_bits);
+    Ok(ImageMetadata {
+        width,
+        height,
+        pixels: u64::from(width) * u64::from(height),
+        format: "JPEG XL".to_string(),
+        encoding: "jpeg-xl".to_string(),
+        bits_per_sample,
+        color_channels,
+        alpha_bits,
+        bits_per_pixel,
+    })
+}
+
+fn read_png_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if bytes.len() < 33 || &bytes[12..16] != b"IHDR" {
+        return Err(ImageMetadataError::InvalidHeader(
+            "missing PNG IHDR chunk".to_string(),
+        ));
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let bit_depth = u32::from(bytes[24]);
+    let color_type = bytes[25];
+    let (color_channels, alpha_bits) = match color_type {
+        0 => (1, 0),
+        2 => (3, 0),
+        3 => (1, 0),
+        4 => (1, bit_depth),
+        6 => (3, bit_depth),
+        _ => {
+            return Err(ImageMetadataError::InvalidHeader(format!(
+                "unsupported PNG color type {color_type}"
+            )));
+        }
+    };
+    Ok(ImageMetadata {
+        width,
+        height,
+        pixels: u64::from(width) * u64::from(height),
+        format: "PNG".to_string(),
+        encoding: "png".to_string(),
+        bits_per_sample: bit_depth,
+        color_channels,
+        alpha_bits,
+        bits_per_pixel: bit_depth
+            .saturating_mul(color_channels)
+            .saturating_add(alpha_bits),
+    })
+}
+
+fn read_jpeg_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= bytes.len() {
+            break;
+        }
+        let marker = bytes[offset];
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if offset + 2 > bytes.len() {
+            return Err(ImageMetadataError::InvalidHeader(
+                "truncated JPEG segment length".to_string(),
+            ));
+        }
+        let segment_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        if segment_len < 2 || offset + segment_len > bytes.len() {
+            return Err(ImageMetadataError::InvalidHeader(
+                "invalid JPEG segment length".to_string(),
+            ));
+        }
+        if is_jpeg_sof_marker(marker) {
+            if segment_len < 8 {
+                return Err(ImageMetadataError::InvalidHeader(
+                    "truncated JPEG frame header".to_string(),
+                ));
+            }
+            let precision = u32::from(bytes[offset + 2]);
+            let height = u32::from(u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]));
+            let width = u32::from(u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]));
+            let color_channels = u32::from(bytes[offset + 7]);
+            return Ok(ImageMetadata {
+                width,
+                height,
+                pixels: u64::from(width) * u64::from(height),
+                format: "JPEG".to_string(),
+                encoding: jpeg_encoding_name(marker).to_string(),
+                bits_per_sample: precision,
+                color_channels,
+                alpha_bits: 0,
+                bits_per_pixel: precision.saturating_mul(color_channels),
+            });
+        }
+        offset += segment_len;
+    }
+
+    Err(ImageMetadataError::InvalidHeader(
+        "missing JPEG start-of-frame segment".to_string(),
+    ))
+}
+
+fn is_jxl_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0x0a])
+        || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0c, b'J', b'X', b'L', b' '])
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf
+    )
+}
+
+fn jpeg_encoding_name(marker: u8) -> &'static str {
+    match marker {
+        0xc0 => "jpeg-baseline",
+        0xc2 => "jpeg-progressive",
+        _ => "jpeg",
+    }
+}
+
+fn advance_to_image_info<'a>(
+    mut decoder: JxlDecoder<states::Initialized>,
+    input: &mut &'a [u8],
+) -> Result<JxlDecoder<states::WithImageInfo>, DisplayError> {
+    loop {
+        match decoder
+            .process(input)
+            .map_err(|error| JxlValidationError::InvalidBitstream(error.to_string()))?
+        {
+            ProcessingResult::Complete { result } => return Ok(result),
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err(DisplayError::Jxl(JxlValidationError::InvalidBitstream(
+                        "unexpected end of JPEG XL input".to_string(),
+                    )));
+                }
+                decoder = fallback;
+            }
+        }
+    }
+}
+
+fn advance_to_frame_info<'a>(
+    mut decoder: JxlDecoder<states::WithImageInfo>,
+    input: &mut &'a [u8],
+) -> Result<JxlDecoder<states::WithFrameInfo>, DisplayError> {
+    loop {
+        match decoder
+            .process(input)
+            .map_err(|error| JxlValidationError::InvalidBitstream(error.to_string()))?
+        {
+            ProcessingResult::Complete { result } => return Ok(result),
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err(DisplayError::Jxl(JxlValidationError::InvalidBitstream(
+                        "unexpected end of JPEG XL input".to_string(),
+                    )));
+                }
+                decoder = fallback;
+            }
+        }
+    }
+}
+
+fn advance_to_frame_done<'a>(
+    mut decoder: JxlDecoder<states::WithFrameInfo>,
+    input: &mut &'a [u8],
+    buffers: &mut [JxlOutputBuffer<'_>],
+) -> Result<JxlDecoder<states::WithImageInfo>, DisplayError> {
+    loop {
+        match decoder
+            .process(input, buffers)
+            .map_err(|error| JxlValidationError::DecodeFailed(error.to_string()))?
+        {
+            ProcessingResult::Complete { result } => return Ok(result),
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err(DisplayError::Jxl(JxlValidationError::DecodeFailed(
+                        "unexpected end of JPEG XL frame".to_string(),
+                    )));
+                }
+                decoder = fallback;
+            }
+        }
+    }
+}
+
+fn display_error_to_validation_error(error: DisplayError) -> JxlValidationError {
+    match error {
+        DisplayError::Io(error) => JxlValidationError::Io(error),
+        DisplayError::Jxl(error) => error,
+        other => JxlValidationError::DecodeFailed(format!("{other:?}")),
+    }
+}
+
+/// Applies EPC resource limits to decoded JPEG XL dimensions.
+fn validate_jxl_dimensions(
+    width: u32,
+    height: u32,
+    kind: EpcImageKind,
+) -> Result<JxlInfo, JxlValidationError> {
     let pixels = u64::from(width) * u64::from(height);
 
     if width > kind.max_dimension() || height > kind.max_dimension() {
@@ -857,62 +1142,6 @@ fn image_info(image: &JxlImage, kind: EpcImageKind) -> Result<JxlInfo, JxlValida
     }
 
     Ok(JxlInfo {
-        width,
-        height,
-        pixels,
-    })
-}
-
-/// Converts decoder samples into interleaved RGBA8 pixels.
-///
-/// The JPEG XL decoder may return grayscale, grayscale plus alpha, RGB, or
-/// RGBA streams. This helper expands all supported layouts into the stable
-/// [`RgbaImage`] contract.
-fn samples_to_rgba8(
-    width: u32,
-    height: u32,
-    channels: u32,
-    samples: &[u8],
-) -> Result<RgbaImage, DisplayError> {
-    let pixel_count = pixel_count(width, height).ok_or(DisplayError::ImageTooLarge)?;
-    let mut pixels =
-        Vec::with_capacity(rgba_len(width, height).ok_or(DisplayError::ImageTooLarge)?);
-
-    match channels {
-        1 => {
-            if samples.len() < pixel_count {
-                return Err(DisplayError::ImageTooLarge);
-            }
-            for &gray in &samples[..pixel_count] {
-                pixels.extend_from_slice(&[gray, gray, gray, 255]);
-            }
-        }
-        2 => {
-            if samples.len() < pixel_count * 2 {
-                return Err(DisplayError::ImageTooLarge);
-            }
-            for sample in samples[..pixel_count * 2].chunks_exact(2) {
-                pixels.extend_from_slice(&[sample[0], sample[0], sample[0], sample[1]]);
-            }
-        }
-        3 => {
-            if samples.len() < pixel_count * 3 {
-                return Err(DisplayError::ImageTooLarge);
-            }
-            for sample in samples[..pixel_count * 3].chunks_exact(3) {
-                pixels.extend_from_slice(&[sample[0], sample[1], sample[2], 255]);
-            }
-        }
-        4 => {
-            if samples.len() < pixel_count * 4 {
-                return Err(DisplayError::ImageTooLarge);
-            }
-            pixels.extend_from_slice(&samples[..pixel_count * 4]);
-        }
-        _ => return Err(DisplayError::UnsupportedChannelCount { channels }),
-    }
-
-    Ok(RgbaImage {
         width,
         height,
         pixels,
@@ -1037,16 +1266,6 @@ fn validate_rgba_display_image(image: &RgbaImage) -> Result<(), DisplayError> {
     Ok(())
 }
 
-/// Computes the sample buffer length for a decoded stream.
-///
-/// Returns `None` if the multiplication does not fit in `usize`.
-fn samples_len(width: u32, height: u32, channels: u32) -> Option<usize> {
-    usize::try_from(width)
-        .ok()?
-        .checked_mul(usize::try_from(height).ok()?)?
-        .checked_mul(usize::try_from(channels).ok()?)
-}
-
 /// Computes the pixel count for an image.
 ///
 /// Returns `None` if the multiplication does not fit in `usize`.
@@ -1063,7 +1282,7 @@ fn rgba_len(width: u32, height: u32) -> Option<usize> {
     pixel_count(width, height)?.checked_mul(4)
 }
 
-/// Validates user-controlled `cjxl` encoder options.
+/// Validates user-controlled JPEG XL encoder options.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn validate_encode_options(options: &EncodeOptions) -> Result<(), EncodeError> {
     if let Some(distance) = options.distance {
@@ -1091,6 +1310,29 @@ fn validate_encode_options(options: &EncodeOptions) -> Result<(), EncodeError> {
     Ok(())
 }
 
+/// Decodes a supported source image to RGBA8 pixels.
+#[cfg(feature = "jxl-encode-libjxl")]
+fn decode_source_image_rgba8(path: &Path) -> Result<RgbaImage, EncodeError> {
+    let image = image::ImageReader::open(path)
+        .map_err(EncodeError::Io)?
+        .decode()
+        .map_err(|error| EncodeError::DecodeImage(error.to_string()))?
+        .to_rgba8();
+    Ok(RgbaImage {
+        width: image.width(),
+        height: image.height(),
+        pixels: image.into_raw(),
+    })
+}
+
+#[cfg(feature = "jxl-encode-libjxl")]
+fn is_jxl_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("jxl"))
+        .unwrap_or(false)
+}
+
 /// Validates that an [`RgbaImage`] has exactly one RGBA byte tuple per pixel.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn validate_rgba_image(image: &RgbaImage) -> Result<(), EncodeError> {
@@ -1106,7 +1348,7 @@ fn validate_rgba_image(image: &RgbaImage) -> Result<(), EncodeError> {
     Ok(())
 }
 
-/// Writes an RGBA8 image to PNG for debugging or `cjxl` staging.
+/// Writes an RGBA8 image to PNG for debugging or preview generation.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn write_rgba_png(path: &Path, image: &RgbaImage) -> Result<(), EncodeError> {
     let file = File::create(path).map_err(EncodeError::Io)?;
@@ -1121,94 +1363,357 @@ fn write_rgba_png(path: &Path, image: &RgbaImage) -> Result<(), EncodeError> {
         .map_err(|error| EncodeError::Png(error.to_string()))
 }
 
-/// Invokes the configured `cjxl` executable with validated options.
-///
-/// The function captures stderr on encoder failure so CLI and binding layers
-/// can surface useful diagnostics to users.
 #[cfg(feature = "jxl-encode-libjxl")]
-fn run_cjxl(
-    input_file: &Path,
-    output_file: &Path,
-    options: &EncodeOptions,
-) -> Result<(), EncodeError> {
-    let mut command = Command::new(&options.cjxl_path);
-    command.arg(input_file).arg(output_file);
+mod libjxl_encoder {
+    use super::{EncodeError, EncodeOptions, RgbaImage};
+    use std::ffi::{c_int, c_uint, c_void};
+    use std::mem::MaybeUninit;
+    use std::ptr;
 
-    let distance;
-    if let Some(value) = options.distance {
-        distance = value.to_string();
-        command.arg("-d").arg(&distance);
+    const JXL_FALSE: c_int = 0;
+    const JXL_TRUE: c_int = 1;
+    const JXL_ENC_SUCCESS: c_int = 0;
+    const JXL_ENC_ERROR: c_int = 1;
+    const JXL_ENC_NEED_MORE_OUTPUT: c_int = 2;
+    const JXL_TYPE_UINT8: c_int = 2;
+    const JXL_NATIVE_ENDIAN: c_int = 0;
+    const JXL_ORIENT_IDENTITY: c_int = 1;
+    const JXL_ENC_FRAME_SETTING_EFFORT: c_int = 0;
+
+    enum JxlEncoder {}
+    enum JxlEncoderFrameSettings {}
+
+    type JxlParallelRetCode = c_int;
+    type JxlParallelRunInit =
+        Option<unsafe extern "C" fn(*mut c_void, usize) -> JxlParallelRetCode>;
+    type JxlParallelRunFunction = Option<unsafe extern "C" fn(*mut c_void, u32)>;
+    type JxlParallelRunner = Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            JxlParallelRunInit,
+            JxlParallelRunFunction,
+            u32,
+            u32,
+        ) -> JxlParallelRetCode,
+    >;
+
+    #[repr(C)]
+    struct JxlPixelFormat {
+        num_channels: u32,
+        data_type: c_int,
+        endianness: c_int,
+        align: usize,
     }
 
-    let quality;
-    if let Some(value) = options.quality {
-        quality = value.to_string();
-        command.arg("-q").arg(&quality);
+    #[repr(C)]
+    struct JxlPreviewHeader {
+        xsize: u32,
+        ysize: u32,
     }
 
-    let effort;
-    if let Some(value) = options.effort {
-        effort = value.to_string();
-        command.arg("-e").arg(&effort);
+    #[repr(C)]
+    struct JxlAnimationHeader {
+        tps_numerator: u32,
+        tps_denominator: u32,
+        num_loops: u32,
+        have_timecodes: c_int,
     }
 
-    let output = command
-        .output()
-        .map_err(|source| EncodeError::CjxlUnavailable {
-            path: options.cjxl_path.clone(),
-            source,
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(EncodeError::CjxlFailed {
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-}
-
-/// Temporary file removed when dropped.
-///
-/// The encoder uses this for PNG staging and byte-returning JXL output without
-/// pulling in an additional temporary-file dependency.
-#[cfg(feature = "jxl-encode-libjxl")]
-struct TempFile {
-    /// Filesystem path of the temporary file.
-    path: std::path::PathBuf,
-}
-
-#[cfg(feature = "jxl-encode-libjxl")]
-impl TempFile {
-    /// Creates a best-effort unique temporary path.
-    ///
-    /// The file is not opened immediately; callers create it through the writer
-    /// or encoder that needs the path.
-    fn new(prefix: &str, extension: &str) -> Result<Self, EncodeError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{now}-{}.{}",
-            std::process::id(),
-            extension
-        ));
-        let _ = std::fs::remove_file(&path);
-        Ok(Self { path })
+    #[repr(C)]
+    struct JxlBasicInfo {
+        have_container: c_int,
+        xsize: u32,
+        ysize: u32,
+        bits_per_sample: u32,
+        exponent_bits_per_sample: u32,
+        intensity_target: f32,
+        min_nits: f32,
+        relative_to_max_display: c_int,
+        linear_below: f32,
+        uses_original_profile: c_int,
+        have_preview: c_int,
+        have_animation: c_int,
+        orientation: c_int,
+        num_color_channels: u32,
+        num_extra_channels: u32,
+        alpha_bits: u32,
+        alpha_exponent_bits: u32,
+        alpha_premultiplied: c_int,
+        preview: JxlPreviewHeader,
+        animation: JxlAnimationHeader,
+        intrinsic_xsize: u32,
+        intrinsic_ysize: u32,
+        padding: [u8; 100],
     }
 
-    /// Returns the temporary file path.
-    fn path(&self) -> &Path {
-        &self.path
+    #[link(name = "jxl")]
+    #[link(name = "jxl_threads")]
+    unsafe extern "C" {
+        fn JxlEncoderCreate(memory_manager: *const c_void) -> *mut JxlEncoder;
+        fn JxlEncoderDestroy(enc: *mut JxlEncoder);
+        fn JxlEncoderSetParallelRunner(
+            enc: *mut JxlEncoder,
+            parallel_runner: JxlParallelRunner,
+            parallel_runner_opaque: *mut c_void,
+        ) -> c_int;
+        fn JxlEncoderGetError(enc: *mut JxlEncoder) -> c_int;
+        fn JxlEncoderProcessOutput(
+            enc: *mut JxlEncoder,
+            next_out: *mut *mut u8,
+            avail_out: *mut usize,
+        ) -> c_int;
+        fn JxlEncoderCloseInput(enc: *mut JxlEncoder);
+        fn JxlEncoderInitBasicInfo(info: *mut JxlBasicInfo);
+        fn JxlEncoderSetBasicInfo(enc: *mut JxlEncoder, info: *const JxlBasicInfo) -> c_int;
+        fn JxlEncoderFrameSettingsCreate(
+            enc: *mut JxlEncoder,
+            source: *const JxlEncoderFrameSettings,
+        ) -> *mut JxlEncoderFrameSettings;
+        fn JxlEncoderFrameSettingsSetOption(
+            frame_settings: *mut JxlEncoderFrameSettings,
+            option: c_int,
+            value: i64,
+        ) -> c_int;
+        fn JxlEncoderSetFrameLossless(
+            frame_settings: *mut JxlEncoderFrameSettings,
+            lossless: c_int,
+        ) -> c_int;
+        fn JxlEncoderSetFrameDistance(
+            frame_settings: *mut JxlEncoderFrameSettings,
+            distance: f32,
+        ) -> c_int;
+        fn JxlEncoderDistanceFromQuality(quality: f32) -> f32;
+        fn JxlEncoderAddImageFrame(
+            frame_settings: *const JxlEncoderFrameSettings,
+            pixel_format: *const JxlPixelFormat,
+            buffer: *const c_void,
+            size: usize,
+        ) -> c_int;
+        fn JxlThreadParallelRunner(
+            runner_opaque: *mut c_void,
+            jpegxl_opaque: *mut c_void,
+            init: JxlParallelRunInit,
+            func: JxlParallelRunFunction,
+            start_range: c_uint,
+            end_range: c_uint,
+        ) -> JxlParallelRetCode;
+        fn JxlThreadParallelRunnerCreate(
+            memory_manager: *const c_void,
+            num_worker_threads: usize,
+        ) -> *mut c_void;
+        fn JxlThreadParallelRunnerDestroy(runner_opaque: *mut c_void);
+        fn JxlThreadParallelRunnerDefaultNumWorkerThreads() -> usize;
     }
-}
 
-#[cfg(feature = "jxl-encode-libjxl")]
-impl Drop for TempFile {
-    /// Removes the temporary file if it still exists.
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    struct Encoder(*mut JxlEncoder);
+
+    impl Encoder {
+        fn new() -> Result<Self, EncodeError> {
+            let enc = unsafe { JxlEncoderCreate(ptr::null()) };
+            if enc.is_null() {
+                Err(EncodeError::JxlEncode(
+                    "libjxl encoder allocation failed".to_string(),
+                ))
+            } else {
+                Ok(Self(enc))
+            }
+        }
+
+        fn last_error(&self) -> c_int {
+            unsafe { JxlEncoderGetError(self.0) }
+        }
+    }
+
+    impl Drop for Encoder {
+        fn drop(&mut self) {
+            unsafe { JxlEncoderDestroy(self.0) };
+        }
+    }
+
+    struct ThreadRunner(*mut c_void);
+
+    impl ThreadRunner {
+        fn new() -> Option<Self> {
+            let default_threads = unsafe { JxlThreadParallelRunnerDefaultNumWorkerThreads() };
+            let threads = std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(default_threads)
+                .min(default_threads.max(1));
+            let runner = unsafe { JxlThreadParallelRunnerCreate(ptr::null(), threads) };
+            if runner.is_null() {
+                None
+            } else {
+                Some(Self(runner))
+            }
+        }
+    }
+
+    impl Drop for ThreadRunner {
+        fn drop(&mut self) {
+            unsafe { JxlThreadParallelRunnerDestroy(self.0) };
+        }
+    }
+
+    pub(super) fn encode_rgba8(
+        image: &RgbaImage,
+        options: &EncodeOptions,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let encoder = Encoder::new()?;
+        let _runner = configure_runner(&encoder)?;
+        set_basic_info(&encoder, image)?;
+        let frame_settings = create_frame_settings(&encoder)?;
+        configure_frame(&encoder, frame_settings, options)?;
+
+        let pixel_format = JxlPixelFormat {
+            num_channels: 4,
+            data_type: JXL_TYPE_UINT8,
+            endianness: JXL_NATIVE_ENDIAN,
+            align: 0,
+        };
+        check_status(
+            unsafe {
+                JxlEncoderAddImageFrame(
+                    frame_settings,
+                    &pixel_format,
+                    image.pixels.as_ptr().cast(),
+                    image.pixels.len(),
+                )
+            },
+            &encoder,
+            "JxlEncoderAddImageFrame",
+        )?;
+        unsafe { JxlEncoderCloseInput(encoder.0) };
+        collect_output(&encoder)
+    }
+
+    fn configure_runner(encoder: &Encoder) -> Result<Option<ThreadRunner>, EncodeError> {
+        let Some(runner) = ThreadRunner::new() else {
+            return Ok(None);
+        };
+        check_status(
+            unsafe {
+                JxlEncoderSetParallelRunner(encoder.0, Some(JxlThreadParallelRunner), runner.0)
+            },
+            encoder,
+            "JxlEncoderSetParallelRunner",
+        )?;
+        Ok(Some(runner))
+    }
+
+    fn set_basic_info(encoder: &Encoder, image: &RgbaImage) -> Result<(), EncodeError> {
+        let mut info = MaybeUninit::<JxlBasicInfo>::uninit();
+        unsafe { JxlEncoderInitBasicInfo(info.as_mut_ptr()) };
+        let mut info = unsafe { info.assume_init() };
+        info.xsize = image.width;
+        info.ysize = image.height;
+        info.bits_per_sample = 8;
+        info.exponent_bits_per_sample = 0;
+        info.orientation = JXL_ORIENT_IDENTITY;
+        info.num_color_channels = 3;
+        info.num_extra_channels = 1;
+        info.alpha_bits = 8;
+        info.alpha_exponent_bits = 0;
+        info.alpha_premultiplied = JXL_FALSE;
+        info.uses_original_profile = JXL_TRUE;
+        check_status(
+            unsafe { JxlEncoderSetBasicInfo(encoder.0, &info) },
+            encoder,
+            "JxlEncoderSetBasicInfo",
+        )
+    }
+
+    fn create_frame_settings(
+        encoder: &Encoder,
+    ) -> Result<*mut JxlEncoderFrameSettings, EncodeError> {
+        let frame_settings = unsafe { JxlEncoderFrameSettingsCreate(encoder.0, ptr::null()) };
+        if frame_settings.is_null() {
+            Err(EncodeError::JxlEncode(
+                "JxlEncoderFrameSettingsCreate returned null".to_string(),
+            ))
+        } else {
+            Ok(frame_settings)
+        }
+    }
+
+    fn configure_frame(
+        encoder: &Encoder,
+        frame_settings: *mut JxlEncoderFrameSettings,
+        options: &EncodeOptions,
+    ) -> Result<(), EncodeError> {
+        if let Some(effort) = options.effort {
+            check_status(
+                unsafe {
+                    JxlEncoderFrameSettingsSetOption(
+                        frame_settings,
+                        JXL_ENC_FRAME_SETTING_EFFORT,
+                        i64::from(effort),
+                    )
+                },
+                encoder,
+                "JxlEncoderFrameSettingsSetOption(EFFORT)",
+            )?;
+        }
+
+        let distance = match (options.quality, options.distance) {
+            (Some(quality), _) => unsafe { JxlEncoderDistanceFromQuality(quality) },
+            (None, Some(distance)) => distance,
+            (None, None) => 1.0,
+        };
+        if distance <= 0.0 {
+            check_status(
+                unsafe { JxlEncoderSetFrameLossless(frame_settings, JXL_TRUE) },
+                encoder,
+                "JxlEncoderSetFrameLossless",
+            )
+        } else {
+            check_status(
+                unsafe { JxlEncoderSetFrameDistance(frame_settings, distance) },
+                encoder,
+                "JxlEncoderSetFrameDistance",
+            )
+        }
+    }
+
+    fn collect_output(encoder: &Encoder) -> Result<Vec<u8>, EncodeError> {
+        let mut output = Vec::new();
+        loop {
+            let start = output.len();
+            output.resize(start + 16 * 1024, 0);
+            let mut next_out = output[start..].as_mut_ptr();
+            let mut avail_out = output.len() - start;
+            let status =
+                unsafe { JxlEncoderProcessOutput(encoder.0, &mut next_out, &mut avail_out) };
+            let written = output.len() - start - avail_out;
+            output.truncate(start + written);
+
+            match status {
+                JXL_ENC_SUCCESS => return Ok(output),
+                JXL_ENC_NEED_MORE_OUTPUT => {}
+                JXL_ENC_ERROR => {
+                    return Err(EncodeError::JxlEncode(format!(
+                        "JxlEncoderProcessOutput failed with error {}",
+                        encoder.last_error()
+                    )));
+                }
+                other => {
+                    return Err(EncodeError::JxlEncode(format!(
+                        "JxlEncoderProcessOutput returned unexpected status {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn check_status(status: c_int, encoder: &Encoder, operation: &str) -> Result<(), EncodeError> {
+        if status == JXL_ENC_SUCCESS {
+            Ok(())
+        } else {
+            Err(EncodeError::JxlEncode(format!(
+                "{operation} failed with status {status} and error {}",
+                encoder.last_error()
+            )))
+        }
     }
 }
 
@@ -1231,7 +1736,7 @@ mod tests {
     fn renders_cover_rgba8_with_resize() {
         let image = decode_jxl_file_rgba8(
             format!(
-                "{}/../../testcases/image/cover.jxl",
+                "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
                 env!("CARGO_MANIFEST_DIR")
             ),
             EpcImageKind::Cover,
@@ -1242,6 +1747,31 @@ mod tests {
         assert!(image.width <= 320);
         assert!(image.height <= 320);
         assert_eq!(image.pixels.len(), image.expected_len());
+    }
+
+    #[test]
+    fn reads_supported_image_metadata() {
+        let jpeg = read_image_metadata_file(format!(
+            "{}/../../testcases/images/arc-de-triomphe-paris.jpeg",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_eq!(jpeg.width, 1100);
+        assert_eq!(jpeg.height, 732);
+        assert_eq!(jpeg.format, "JPEG");
+        assert_eq!(jpeg.encoding, "jpeg-baseline");
+        assert_eq!(jpeg.bits_per_pixel, 24);
+
+        let jxl = read_image_metadata_file(format!(
+            "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_eq!(jxl.width, 1100);
+        assert_eq!(jxl.height, 732);
+        assert_eq!(jxl.format, "JPEG XL");
+        assert_eq!(jxl.encoding, "jpeg-xl");
+        assert_eq!(jxl.bits_per_sample, 8);
     }
 
     #[test]
@@ -1278,7 +1808,7 @@ mod tests {
     #[test]
     fn derives_thumbnail_from_cover_file() {
         let image = derive_thumbnail_rgba8_from_cover_jxl_file(format!(
-            "{}/../../testcases/image/cover.jxl",
+            "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
@@ -1300,8 +1830,10 @@ mod tests {
         let options = SimpleFileOptions::default();
         zip.add_directory("media/", options).unwrap();
         zip.start_file(COVER_PATH, options).unwrap();
-        zip.write_all(include_bytes!("../../../testcases/image/cover.jxl"))
-            .unwrap();
+        zip.write_all(include_bytes!(
+            "../../../testcases/images/arc-de-triomphe-paris.jxl"
+        ))
+        .unwrap();
         zip.finish().unwrap();
 
         let image = render_cover_from_epc_rgba8(&archive_path, RenderOptions::fit(96, 96)).unwrap();
@@ -1314,11 +1846,7 @@ mod tests {
 
     #[cfg(feature = "jxl-encode-libjxl")]
     #[test]
-    fn encodes_rgba8_with_cjxl_when_available() {
-        if Command::new("cjxl").arg("--version").output().is_err() {
-            return;
-        }
-
+    fn encodes_rgba8_with_libjxl_encoder() {
         let image = RgbaImage {
             width: 2,
             height: 2,
@@ -1338,13 +1866,9 @@ mod tests {
 
     #[cfg(feature = "jxl-encode-libjxl")]
     #[test]
-    fn encodes_thumbnail_from_cover_bytes_with_cjxl_when_available() {
-        if Command::new("cjxl").arg("--version").output().is_err() {
-            return;
-        }
-
+    fn encodes_thumbnail_from_cover_bytes_with_libjxl_encoder() {
         let bytes = encode_thumbnail_from_cover_jxl_bytes(
-            include_bytes!("../../../testcases/image/cover.jxl"),
+            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
             &EncodeOptions::default(),
         )
         .unwrap();

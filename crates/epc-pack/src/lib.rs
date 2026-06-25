@@ -19,13 +19,18 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use epc_core::{
-    is_valid_card_id, CreatedLocalTime, HashEntry, HashTransform, Hashes, Manifest, SignatureEntry,
-    SignaturePayload, SignaturePolicy, SignatureProof, SignaturePublicKey, SignatureRequiredKey,
-    SignatureSigner, CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256,
-    INTEGRITY_VERSION_1, MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MESSAGE_PATH,
-    SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
+    cover_mime_for_path, is_supported_cover_path, is_valid_card_id, CreatedLocalTime, HashEntry,
+    HashTransform, Hashes, Manifest, SignatureEntry, SignaturePayload, SignaturePolicy,
+    SignatureProof, SignaturePublicKey, SignatureRequiredKey, SignatureSigner,
+    CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1,
+    MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR,
+    SIGNATURE_PATH, THUMBNAIL_PATH,
 };
-use epc_validate::{validate_core_directory, validate_epc_file, ValidationReport};
+use epc_image::ImageMetadataError;
+use epc_validate::{
+    validate_core_directory, validate_core_directory_with_options, validate_epc_file,
+    ValidationOptions, ValidationReport,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -46,8 +51,14 @@ pub struct CreateDraftRequest {
     /// Device-local creation context captured when the draft is initialized.
     pub created_local_time: CreatedLocalTime,
 
+    /// Optional card identifier to write into `manifest.json`.
+    pub id: Option<String>,
+
     /// Whether an existing `manifest.json` should be overwritten.
     pub force: bool,
+
+    /// Capsule-relative cover path to declare in `manifest.json`.
+    pub cover_path: String,
 }
 
 impl CreateDraftRequest {
@@ -57,7 +68,9 @@ impl CreateDraftRequest {
             output_dir: output_dir.into(),
             author_display_name: author_display_name.into(),
             created_local_time: detect_device_created_local_time(),
+            id: None,
             force: false,
+            cover_path: COVER_PATH.to_string(),
         }
     }
 
@@ -67,9 +80,21 @@ impl CreateDraftRequest {
         self
     }
 
+    /// Sets the card identifier written to `manifest.json`.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     /// Allows replacing an existing `manifest.json`.
     pub fn with_force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Sets the cover path declared in `manifest.json`.
+    pub fn with_cover_path(mut self, cover_path: impl Into<String>) -> Self {
+        self.cover_path = cover_path.into();
         self
     }
 }
@@ -192,6 +217,13 @@ impl From<zip::result::ZipError> for PackError {
     }
 }
 
+fn pack_error_to_io(error: PackError) -> io::Error {
+    match error {
+        PackError::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::InvalidData, format!("{other:?}")),
+    }
+}
+
 /// Creates a new unpacked EPC draft directory.
 ///
 /// This writes a fresh `manifest.json` with a generated `escale:<ULID>` id,
@@ -202,22 +234,39 @@ impl From<zip::result::ZipError> for PackError {
 /// are overwritten only when `force` is set.
 pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, PackError> {
     let root = request.output_dir;
+    let id = match request.id {
+        Some(id) => id,
+        None => generate_card_id()?,
+    };
+    if !is_valid_card_id(&id) {
+        return Err(PackError::InvalidFilenameMetadata(
+            "card id must use the escale:<26-char-ulid> format".to_string(),
+        ));
+    }
+    if !is_supported_cover_path(&request.cover_path) {
+        return Err(PackError::InvalidFilenameMetadata(
+            "cover path must be media/cover.jpg, media/cover.jpeg, media/cover.png, or media/cover.jxl"
+                .to_string(),
+        ));
+    }
+
     fs::create_dir_all(root.join("media"))?;
     fs::create_dir_all(root.join("text"))?;
 
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         epc_version: epc_core::EPC_VERSION_1_0.to_string(),
         profile: epc_core::CORE_PROFILE.to_string(),
         object_type: epc_core::EPC_OBJECT_TYPE_POSTCARD.to_string(),
-        id: generate_card_id()?,
+        id,
         created_at: current_utc_timestamp()?,
         created_local_time: request.created_local_time,
         sealed_at: String::new(),
         author: epc_core::Author {
             display_name: request.author_display_name,
         },
-        content: core_content_manifest(),
+        content: core_content_manifest(&request.cover_path),
     };
+    refresh_manifest_image_metadata_fields(&root, &mut manifest)?;
 
     let manifest_bytes = serde_json::to_string_pretty(&manifest)?;
     if request.force {
@@ -239,6 +288,18 @@ pub fn draft_filename_from_directory(root: impl AsRef<Path>) -> Result<String, P
     let bytes = fs::read(root.as_ref().join(MANIFEST_PATH))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
     draft_filename(&manifest)
+}
+
+/// Refreshes image metadata in `manifest.json` from the declared media files.
+///
+/// Missing image files leave their manifest metadata empty, which allows draft
+/// initialization before media insertion. Unsupported or malformed image files
+/// return an error so callers can report the failed insertion.
+pub fn refresh_manifest_image_metadata(root: impl AsRef<Path>) -> Result<(), PackError> {
+    let root = root.as_ref();
+    let mut manifest = read_manifest(root)?;
+    refresh_manifest_image_metadata_fields(root, &mut manifest)?;
+    write_manifest(root, &manifest)
 }
 
 /// Signs an unpacked EPC directory by writing `proof/signature.json`.
@@ -298,8 +359,9 @@ pub fn sign_core_format_directory_with_ssh_key(
 
 /// Packs a source directory into a valid EPC 1.0 `core-format` archive.
 ///
-/// The source directory must contain `manifest.json`, `media/cover.jxl`,
-/// `media/thumbnail.jxl`, and `text/message.md`. `proof/hashes.json` is
+/// The source directory must contain `manifest.json`, one supported
+/// `media/cover.*` image, `media/thumbnail.jxl`, and `text/message.md`.
+/// `proof/hashes.json` is
 /// regenerated during packing, even when a source copy already exists.
 pub fn pack_core_format(request: PackRequest) -> Result<(), PackError> {
     let staging = TempDir::new("epc-pack");
@@ -326,17 +388,20 @@ pub fn pack_core_format_to_directory(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, PackError> {
+    pack_core_format_to_directory_with_options(source_dir, output_dir, ValidationOptions::default())
+}
+
+fn pack_core_format_to_directory_with_options(
+    source_dir: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    validation_options: ValidationOptions,
+) -> Result<PathBuf, PackError> {
     let source_dir = source_dir.as_ref();
     let output_dir = output_dir.as_ref();
     let staging = TempDir::new("epc-pack");
     copy_core_source(source_dir, staging.path())?;
     let sealed_manifest = seal_manifest_if_needed(staging.path())?;
     write_hashes(staging.path())?;
-
-    let report = validate_core_directory(staging.path());
-    if !report.is_valid() {
-        return Err(PackError::InvalidSource(report));
-    }
 
     let output_file = output_dir.join(sealed_filename_from_manifest(staging.path())?);
     if output_file.exists() {
@@ -345,6 +410,12 @@ pub fn pack_core_format_to_directory(
             format!("output file already exists: {}", output_file.display()),
         )));
     }
+
+    let report = validate_core_directory_with_options(staging.path(), validation_options);
+    if !report.is_valid() {
+        return Err(PackError::InvalidSource(report));
+    }
+
     write_manifest(source_dir, &sealed_manifest)?;
     write_zip(staging.path(), &output_file)?;
     Ok(output_file)
@@ -358,10 +429,16 @@ pub fn pack_core_format_to_directory_signed(
     force_signature: bool,
 ) -> Result<PathBuf, PackError> {
     let source_dir = source_dir.as_ref();
-    if force_signature || !source_dir.join(SIGNATURE_PATH).exists() {
+    let refreshed_signature = force_signature || !source_dir.join(SIGNATURE_PATH).exists();
+    if refreshed_signature {
         sign_core_format_directory_with_ssh_key(source_dir, private_key_file.as_ref(), true)?;
     }
-    pack_core_format_to_directory(source_dir, output_dir)
+    let validation_options = if refreshed_signature {
+        ValidationOptions::default().without_jxl_images()
+    } else {
+        ValidationOptions::default()
+    };
+    pack_core_format_to_directory_with_options(source_dir, output_dir, validation_options)
 }
 
 fn seal_manifest_if_needed(root: &Path) -> Result<Manifest, PackError> {
@@ -414,7 +491,7 @@ fn complete_manifest_defaults(value: &mut Value) -> Result<(), PackError> {
     }
     insert_missing_string(object, "sealed_at", "");
 
-    let mut content = serde_json::to_value(core_content_manifest())?;
+    let mut content = serde_json::to_value(core_content_manifest(COVER_PATH))?;
     if let Some(existing_content) = object.get_mut("content") {
         merge_missing(existing_content, &mut content);
     } else {
@@ -444,15 +521,19 @@ fn merge_missing(target: &mut Value, defaults: &mut Value) {
     }
 }
 
-fn core_content_manifest() -> epc_core::Content {
+fn core_content_manifest(cover_path: &str) -> epc_core::Content {
     epc_core::Content {
         cover: epc_core::MediaContent {
-            path: COVER_PATH.to_string(),
-            mime: "image/jxl".to_string(),
+            path: cover_path.to_string(),
+            mime: cover_mime_for_path(cover_path)
+                .unwrap_or("image/jxl")
+                .to_string(),
+            image: None,
         },
         thumbnail: epc_core::MediaContent {
             path: THUMBNAIL_PATH.to_string(),
             mime: "image/jxl".to_string(),
+            image: None,
         },
         message: epc_core::MessageContent {
             path: MESSAGE_PATH.to_string(),
@@ -460,6 +541,39 @@ fn core_content_manifest() -> epc_core::Content {
             markdown_profile: epc_core::MARKDOWN_CORE_PROFILE.to_string(),
             markdown_profile_version: epc_core::MARKDOWN_CORE_PROFILE_VERSION.to_string(),
         },
+    }
+}
+
+fn refresh_manifest_image_metadata_fields(
+    root: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), PackError> {
+    manifest.content.cover.image =
+        read_optional_image_metadata(root, &manifest.content.cover.path)?;
+    manifest.content.thumbnail.image =
+        read_optional_image_metadata(root, &manifest.content.thumbnail.path)?;
+    Ok(())
+}
+
+fn read_optional_image_metadata(
+    root: &Path,
+    content_path: &str,
+) -> Result<Option<epc_core::ImageMetadata>, PackError> {
+    let path = root.join(content_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    epc_image::read_image_metadata_file(&path)
+        .map(Some)
+        .map_err(image_metadata_error_to_pack_error)
+}
+
+fn image_metadata_error_to_pack_error(error: ImageMetadataError) -> PackError {
+    match error {
+        ImageMetadataError::Io(error) => PackError::Io(error),
+        other => {
+            PackError::InvalidFilenameMetadata(format!("image metadata cannot be read: {other:?}"))
+        }
     }
 }
 
@@ -650,7 +764,10 @@ fn copy_core_source(source: &Path, staging: &Path) -> io::Result<()> {
         fs::create_dir_all(staging.join(directory))?;
     }
 
-    for path in [MANIFEST_PATH, COVER_PATH, THUMBNAIL_PATH, MESSAGE_PATH] {
+    let manifest = read_manifest(source).map_err(pack_error_to_io)?;
+    let cover_path = manifest.content.cover.path.as_str();
+
+    for path in [MANIFEST_PATH, cover_path, THUMBNAIL_PATH, MESSAGE_PATH] {
         let destination = staging.join(path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -689,9 +806,13 @@ fn write_signature_proof(root: &Path, proof: SignatureProof) -> Result<(), PackE
 }
 
 fn compute_hashes(root: &Path) -> Result<Hashes, PackError> {
+    let manifest = read_manifest(root)?;
     let entries = [
         (MANIFEST_PATH, HashTransform::Jcs),
-        (COVER_PATH, HashTransform::Identity),
+        (
+            manifest.content.cover.path.as_str(),
+            HashTransform::Identity,
+        ),
         (THUMBNAIL_PATH, HashTransform::Identity),
         (MESSAGE_PATH, HashTransform::Identity),
     ]
@@ -979,9 +1100,10 @@ fn write_zip(root: &Path, output_file: &Path) -> Result<(), PackError> {
         zip.add_directory(directory, directory_options)?;
     }
 
+    let manifest = read_manifest(root)?;
     let mut paths = vec![
         MANIFEST_PATH,
-        COVER_PATH,
+        manifest.content.cover.path.as_str(),
         THUMBNAIL_PATH,
         MESSAGE_PATH,
         HASHES_PATH,
@@ -1136,7 +1258,8 @@ fn is_normalized_utc_offset(value: &str) -> bool {
     hour <= 23 && minute <= 59
 }
 
-fn generate_card_id() -> Result<String, PackError> {
+/// Generates a new EPC card identifier using an ULID-compatible payload.
+pub fn generate_card_id() -> Result<String, PackError> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
         PackError::InvalidFilenameMetadata(
             "system clock must not be before the Unix epoch".to_string(),
@@ -1907,16 +2030,25 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-vectors"))]
 fn write_sample_jxl_files(root: &Path) -> io::Result<()> {
     fs::write(
         root.join(COVER_PATH),
-        include_bytes!("../../../testcases/image/cover.jxl"),
+        include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
     )?;
     fs::write(
         root.join(THUMBNAIL_PATH),
-        include_bytes!("../../../testcases/image/thumbnail.jxl"),
+        include_bytes!("../../../testcases/images/rose.jxl"),
     )?;
     Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-vectors")))]
+fn write_sample_jxl_files(_root: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "test vector fixtures are not embedded; rebuild epc-pack with the `test-vectors` feature",
+    ))
 }
 
 fn write_max_markdown(path: &Path) -> io::Result<()> {
@@ -2251,7 +2383,10 @@ mod tests {
         assert!(!manifest_after_pack.created_at.is_empty());
         assert!(!manifest_after_pack.created_local_time.time_zone.is_empty());
         assert!(!manifest_after_pack.sealed_at.is_empty());
-        assert_eq!(manifest_after_pack.content, core_content_manifest());
+        assert_eq!(
+            manifest_after_pack.content,
+            core_content_manifest(COVER_PATH)
+        );
         assert!(validate_epc_file(&output).is_valid());
     }
 
@@ -2580,10 +2715,12 @@ mod tests {
             cover: epc_core::MediaContent {
                 path: COVER_PATH.to_string(),
                 mime: "image/jxl".to_string(),
+                image: None,
             },
             thumbnail: epc_core::MediaContent {
                 path: THUMBNAIL_PATH.to_string(),
                 mime: "image/jxl".to_string(),
+                image: None,
             },
             message: epc_core::MessageContent {
                 path: MESSAGE_PATH.to_string(),
