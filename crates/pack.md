@@ -38,7 +38,7 @@ Le flux normal de création d'un EPC est :
 6. Packer le dossier en `.epc`.
 
 La dérivation du thumbnail est fournie par `epc-image` : elle redimensionne la
-couverture dans une boîte de 1024x1024 pixels, conserve le ratio, ne recadre pas
+couverture dans une boîte de 256x256 pixels, conserve le ratio, ne recadre pas
 et n'agrandit pas l'image.
 
 `epc-pack` régénère `proof/hashes.json` lors de la signature et du packing.

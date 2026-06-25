@@ -953,7 +953,15 @@ fn encode_and_validate_file(
     kind: epc_image::EpcImageKind,
     options: &epc_image::EncodeOptions,
 ) -> Result<(), String> {
-    epc_image::encode_file_to_jxl_file(input, output, options).map_err(|error| {
+    let encode_result = match kind {
+        epc_image::EpcImageKind::Cover => {
+            epc_image::encode_file_to_jxl_file(input, output, options)
+        }
+        epc_image::EpcImageKind::Thumbnail => {
+            epc_image::encode_file_to_thumbnail_jxl_file(input, output, options)
+        }
+    };
+    encode_result.map_err(|error| {
         format!(
             "failed to encode {}: {}",
             output.display(),

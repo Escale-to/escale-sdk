@@ -2240,7 +2240,7 @@ mod tests {
     fn write_sample_thumbnail_jxl(root: &Path) {
         fs::write(
             root.join(THUMBNAIL_PATH),
-            include_bytes!("../../../testcases/images/rose.jxl"),
+            include_bytes!("../../../testcases/images/thumbnail-256.jxl"),
         )
         .unwrap();
     }

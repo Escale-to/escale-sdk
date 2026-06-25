@@ -657,7 +657,7 @@ pub fn resize_rgba8_to_fit(
 
 /// Derives the canonical EPC thumbnail pixels from a decoded cover image.
 ///
-/// This applies the EPC thumbnail rule: fit within 1024x1024 pixels, preserve
+/// This applies the EPC thumbnail rule: fit within 256x256 pixels, preserve
 /// the cover aspect ratio, do not crop, and do not upscale.
 pub fn derive_thumbnail_rgba8_from_cover(cover: &RgbaImage) -> Result<RgbaImage, DisplayError> {
     resize_rgba8_to_fit(cover, MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_DIMENSION)
@@ -719,7 +719,7 @@ pub fn encode_thumbnail_from_cover_jxl_bytes(
 ) -> Result<Vec<u8>, ThumbnailError> {
     let thumbnail = derive_thumbnail_rgba8_from_cover_jxl(cover_jxl)?;
     let thumbnail_options = options.for_thumbnail();
-    let bytes = encode_rgba8_to_jxl_bytes(&thumbnail, &thumbnail_options)?;
+    let bytes = encode_thumbnail_rgba8_to_jxl_bytes(&thumbnail, &thumbnail_options)?;
     decode_jxl_rgba8(&bytes, EpcImageKind::Thumbnail, RenderOptions::original())?;
     Ok(bytes)
 }
@@ -736,7 +736,7 @@ pub fn encode_thumbnail_from_cover_jxl_file(
 ) -> Result<(), ThumbnailError> {
     let thumbnail = derive_thumbnail_rgba8_from_cover_jxl_file(cover_file)?;
     let thumbnail_options = options.for_thumbnail();
-    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
+    encode_thumbnail_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
     validate_jxl_file(thumbnail_file, EpcImageKind::Thumbnail)?;
     Ok(())
 }
@@ -754,7 +754,7 @@ pub fn encode_thumbnail_from_cover_file(
 ) -> Result<(), ThumbnailError> {
     let thumbnail = derive_thumbnail_rgba8_from_cover_file(cover_file)?;
     let thumbnail_options = options.for_thumbnail();
-    encode_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
+    encode_thumbnail_rgba8_to_jxl_file(&thumbnail, thumbnail_file.as_ref(), &thumbnail_options)?;
     validate_jxl_file(thumbnail_file, EpcImageKind::Thumbnail)?;
     Ok(())
 }
@@ -799,6 +799,22 @@ pub fn encode_file_to_jxl_file(
     std::fs::write(output_file, bytes).map_err(EncodeError::Io)
 }
 
+/// Encodes an input JPEG or PNG image file into a thumbnail JPEG XL without alpha.
+///
+/// The source image is decoded as RGBA8, then encoded as RGB JPEG XL. This does
+/// not resize the source; callers should still validate the output against
+/// [`EpcImageKind::Thumbnail`] when accepting arbitrary inputs.
+#[cfg(feature = "jxl-encode-libjxl")]
+pub fn encode_file_to_thumbnail_jxl_file(
+    input_file: impl AsRef<Path>,
+    output_file: impl AsRef<Path>,
+    options: &EncodeOptions,
+) -> Result<(), EncodeError> {
+    validate_encode_options(options)?;
+    let image = decode_source_image_rgba8(input_file.as_ref())?;
+    encode_thumbnail_rgba8_to_jxl_file(&image, output_file, options)
+}
+
 /// Encodes RGBA8 pixels into a JPEG XL file.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_rgba8_to_jxl_file(
@@ -822,6 +838,26 @@ pub fn encode_rgba8_to_jxl_bytes(
     validate_rgba_image(image)?;
     validate_encode_options(options)?;
     libjxl_encoder::encode_rgba8(image, options)
+}
+
+#[cfg(feature = "jxl-encode-libjxl")]
+fn encode_thumbnail_rgba8_to_jxl_file(
+    image: &RgbaImage,
+    output_file: impl AsRef<Path>,
+    options: &EncodeOptions,
+) -> Result<(), EncodeError> {
+    let bytes = encode_thumbnail_rgba8_to_jxl_bytes(image, options)?;
+    std::fs::write(output_file, bytes).map_err(EncodeError::Io)
+}
+
+#[cfg(feature = "jxl-encode-libjxl")]
+fn encode_thumbnail_rgba8_to_jxl_bytes(
+    image: &RgbaImage,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_rgba_image(image)?;
+    validate_encode_options(options)?;
+    libjxl_encoder::encode_rgba8_as_rgb(image, options)
 }
 
 /// Writes RGBA8 pixels to a PNG file.
@@ -1559,14 +1595,36 @@ mod libjxl_encoder {
         image: &RgbaImage,
         options: &EncodeOptions,
     ) -> Result<Vec<u8>, EncodeError> {
+        encode_image_frame(image, options, true)
+    }
+
+    pub(super) fn encode_rgba8_as_rgb(
+        image: &RgbaImage,
+        options: &EncodeOptions,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_image_frame(image, options, false)
+    }
+
+    fn encode_image_frame(
+        image: &RgbaImage,
+        options: &EncodeOptions,
+        include_alpha: bool,
+    ) -> Result<Vec<u8>, EncodeError> {
         let encoder = Encoder::new()?;
         let _runner = configure_runner(&encoder)?;
-        set_basic_info(&encoder, image)?;
+        set_basic_info(&encoder, image, include_alpha)?;
         let frame_settings = create_frame_settings(&encoder)?;
         configure_frame(&encoder, frame_settings, options)?;
 
+        let rgb_pixels;
+        let (pixels, num_channels) = if include_alpha {
+            (image.pixels.as_slice(), 4)
+        } else {
+            rgb_pixels = rgba_to_rgb_pixels(image)?;
+            (rgb_pixels.as_slice(), 3)
+        };
         let pixel_format = JxlPixelFormat {
-            num_channels: 4,
+            num_channels,
             data_type: JXL_TYPE_UINT8,
             endianness: JXL_NATIVE_ENDIAN,
             align: 0,
@@ -1576,8 +1634,8 @@ mod libjxl_encoder {
                 JxlEncoderAddImageFrame(
                     frame_settings,
                     &pixel_format,
-                    image.pixels.as_ptr().cast(),
-                    image.pixels.len(),
+                    pixels.as_ptr().cast(),
+                    pixels.len(),
                 )
             },
             &encoder,
@@ -1585,6 +1643,26 @@ mod libjxl_encoder {
         )?;
         unsafe { JxlEncoderCloseInput(encoder.0) };
         collect_output(&encoder)
+    }
+
+    fn rgba_to_rgb_pixels(image: &RgbaImage) -> Result<Vec<u8>, EncodeError> {
+        let pixel_count = usize::try_from(image.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(image.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(EncodeError::InvalidOptions(
+                "image dimensions are too large",
+            ))?;
+        let mut rgb = Vec::with_capacity(pixel_count.checked_mul(3).ok_or(
+            EncodeError::InvalidOptions("image dimensions are too large"),
+        )?);
+        for pixel in image.pixels.chunks_exact(4) {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+        Ok(rgb)
     }
 
     fn configure_runner(encoder: &Encoder) -> Result<Option<ThreadRunner>, EncodeError> {
@@ -1601,7 +1679,11 @@ mod libjxl_encoder {
         Ok(Some(runner))
     }
 
-    fn set_basic_info(encoder: &Encoder, image: &RgbaImage) -> Result<(), EncodeError> {
+    fn set_basic_info(
+        encoder: &Encoder,
+        image: &RgbaImage,
+        include_alpha: bool,
+    ) -> Result<(), EncodeError> {
         let mut info = MaybeUninit::<JxlBasicInfo>::uninit();
         unsafe { JxlEncoderInitBasicInfo(info.as_mut_ptr()) };
         let mut info = unsafe { info.assume_init() };
@@ -1611,8 +1693,8 @@ mod libjxl_encoder {
         info.exponent_bits_per_sample = 0;
         info.orientation = JXL_ORIENT_IDENTITY;
         info.num_color_channels = 3;
-        info.num_extra_channels = 1;
-        info.alpha_bits = 8;
+        info.num_extra_channels = if include_alpha { 1 } else { 0 };
+        info.alpha_bits = if include_alpha { 8 } else { 0 };
         info.alpha_exponent_bits = 0;
         info.alpha_premultiplied = JXL_FALSE;
         info.uses_original_profile = JXL_TRUE;
@@ -1874,9 +1956,11 @@ mod tests {
         .unwrap();
         let decoded =
             decode_jxl_rgba8(&bytes, EpcImageKind::Thumbnail, RenderOptions::original()).unwrap();
+        let metadata = read_image_metadata(&bytes).unwrap();
 
         assert!(decoded.width <= MAX_THUMBNAIL_DIMENSION);
         assert!(decoded.height <= MAX_THUMBNAIL_DIMENSION);
         assert_eq!(decoded.pixels.len(), decoded.expected_len());
+        assert_eq!(metadata.alpha_bits, 0);
     }
 }

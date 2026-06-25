@@ -344,13 +344,13 @@ La commande :
 1. crée `drafts/postcard-001/media` si nécessaire ;
 2. encode la source en `media/cover.jxl` ;
 3. décode la couverture en RGBA8 ;
-4. génère une miniature redimensionnée dans une boîte de 1024x1024 pixels ;
+4. génère une miniature redimensionnée dans une boîte de 256x256 pixels ;
 5. encode cette miniature en `media/thumbnail.jxl` ;
 6. valide les deux fichiers JXL ;
 7. affiche les deux chemins générés sur `stdout`.
 
 La miniature conserve le ratio de la couverture, n'est pas recadrée et n'est
-pas agrandie si la couverture tient déjà dans 1024x1024 pixels.
+pas agrandie si la couverture tient déjà dans 256x256 pixels.
 Par défaut, elle est encodée en qualité 80 plutôt qu'en lossless afin de rester
 nettement plus légère que la couverture.
 

@@ -2038,7 +2038,7 @@ fn write_sample_jxl_files(root: &Path) -> io::Result<()> {
     )?;
     fs::write(
         root.join(THUMBNAIL_PATH),
-        include_bytes!("../../../testcases/images/rose.jxl"),
+        include_bytes!("../../../testcases/images/thumbnail-256.jxl"),
     )?;
     Ok(())
 }

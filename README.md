@@ -109,7 +109,7 @@ escale-TTTTTT-RR/
 
 When `create` receives a `.jpg`, `.jpeg`, or `.png` file, it creates a sibling
 draft directory named `escale-TTTTTT-RR`, writes `media/cover.jxl`, and derives
-`media/thumbnail.jxl` from that cover with a 1024x1024 fit, preserving aspect
+`media/thumbnail.jxl` from that cover with a 256x256 fit, preserving aspect
 ratio without cropping or upscaling. `TTTTTT` is the device-local `HHMMSS`
 compressed in base36 on six characters and `RR` is a short anti-collision
 suffix.

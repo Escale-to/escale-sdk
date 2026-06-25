@@ -185,7 +185,7 @@ encode_rgba8_to_jxl_file(
 )?;
 ```
 
-Cette fonction applique la règle EPC : boîte maximale de 1024x1024 pixels,
+Cette fonction applique la règle EPC : boîte maximale de 256x256 pixels,
 ratio de la couverture conservé, aucun recadrage et aucun agrandissement si
 l'image est déjà plus petite. Le résultat est ensuite encodé en
 `media/thumbnail.jxl`.
