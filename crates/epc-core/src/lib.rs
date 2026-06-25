@@ -47,10 +47,11 @@ pub const MANIFEST_PATH: &str = "manifest.json";
 pub const COVER_PATH: &str = "media/cover.jxl";
 
 /// Supported cover image paths for EPC 1.0 `core-format`.
-pub const SUPPORTED_COVER_PATHS: [&str; 4] = [
+pub const SUPPORTED_COVER_PATHS: [&str; 5] = [
     "media/cover.jpg",
     "media/cover.jpeg",
     "media/cover.png",
+    "media/cover.webp",
     "media/cover.jxl",
 ];
 
@@ -487,6 +488,7 @@ pub fn cover_mime_for_path(path: &str) -> Option<&'static str> {
     match path {
         "media/cover.jpg" | "media/cover.jpeg" => Some("image/jpeg"),
         "media/cover.png" => Some("image/png"),
+        "media/cover.webp" => Some("image/webp"),
         "media/cover.jxl" => Some("image/jxl"),
         _ => None,
     }

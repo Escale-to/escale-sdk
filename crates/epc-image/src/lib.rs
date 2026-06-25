@@ -8,7 +8,7 @@
 //! - decode `media/cover.jxl` or `media/thumbnail.jxl` into RGBA8 pixels;
 //! - resize decoded images for display while preserving aspect ratio;
 //! - derive the canonical EPC thumbnail from a cover image;
-//! - optionally encode JPEG, PNG, or RGBA8 inputs to JPEG XL through libjxl.
+//! - optionally encode JPEG, PNG, WebP, or RGBA8 inputs to JPEG XL through libjxl.
 //!
 //! The public display format is [`RgbaImage`]: interleaved 8-bit RGBA pixels in
 //! row-major order, with dimensions already adjusted for JPEG XL orientation.
@@ -518,8 +518,9 @@ pub fn validate_jxl_file(
 
 /// Reads still-image metadata from a supported EPC media file.
 ///
-/// JPEG XL, JPEG, and PNG are supported because these are the image encodings
-/// accepted by the `core-format` manifest for cover or thumbnail resources.
+/// JPEG XL, JPEG, PNG, and WebP are supported because these are the image
+/// encodings accepted by the `core-format` manifest for cover or thumbnail
+/// resources.
 pub fn read_image_metadata_file(
     path: impl AsRef<Path>,
 ) -> Result<ImageMetadata, ImageMetadataError> {
@@ -535,6 +536,8 @@ pub fn read_image_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataE
         read_png_metadata(bytes)
     } else if bytes.starts_with(&[0xff, 0xd8]) {
         read_jpeg_metadata(bytes)
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        read_webp_metadata(bytes)
     } else {
         Err(ImageMetadataError::UnsupportedFormat)
     }
@@ -743,9 +746,9 @@ pub fn encode_thumbnail_from_cover_jxl_file(
 
 /// Encodes a canonical EPC thumbnail file from a supported cover source file.
 ///
-/// The cover source may be JPEG, PNG, or JPEG XL. Only the thumbnail output is
-/// encoded as JPEG XL; the caller remains responsible for storing the cover
-/// source bytes unchanged in the EPC capsule.
+/// The cover source may be JPEG, PNG, WebP, or JPEG XL. Only the thumbnail
+/// output is encoded as JPEG XL; the caller remains responsible for storing the
+/// cover source bytes unchanged in the EPC capsule.
 #[cfg(feature = "jxl-encode-libjxl")]
 pub fn encode_thumbnail_from_cover_file(
     cover_file: impl AsRef<Path>,
@@ -783,7 +786,7 @@ pub fn encode_png_file_to_jxl_file(
     encode_file_to_jxl_file(input_file, output_file, options)
 }
 
-/// Encodes an input JPEG or PNG image file into JPEG XL.
+/// Encodes an input JPEG, PNG, or WebP image file into JPEG XL.
 ///
 /// This is the generic file-based encoder entry point. Prefer the typed helper
 /// names in CLI and binding APIs when they make user intent clearer.
@@ -799,7 +802,7 @@ pub fn encode_file_to_jxl_file(
     std::fs::write(output_file, bytes).map_err(EncodeError::Io)
 }
 
-/// Encodes an input JPEG or PNG image file into a thumbnail JPEG XL without alpha.
+/// Encodes an input JPEG, PNG, or WebP image file into a thumbnail JPEG XL without alpha.
 ///
 /// The source image is decoded as RGBA8, then encoded as RGB JPEG XL. This does
 /// not resize the source; callers should still validate the output against
@@ -1057,6 +1060,103 @@ fn read_jpeg_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError>
     Err(ImageMetadataError::InvalidHeader(
         "missing JPEG start-of-frame segment".to_string(),
     ))
+}
+
+fn read_webp_metadata(bytes: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return Err(ImageMetadataError::InvalidHeader(
+            "missing WebP RIFF header".to_string(),
+        ));
+    }
+
+    let mut offset = 12;
+    while offset + 8 <= bytes.len() {
+        let chunk_type = &bytes[offset..offset + 4];
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        offset += 8;
+        if offset + chunk_len > bytes.len() {
+            return Err(ImageMetadataError::InvalidHeader(
+                "truncated WebP chunk".to_string(),
+            ));
+        }
+
+        let chunk = &bytes[offset..offset + chunk_len];
+        match chunk_type {
+            b"VP8 " => return read_webp_vp8_metadata(chunk),
+            b"VP8L" => return read_webp_vp8l_metadata(chunk),
+            b"VP8X" => return read_webp_vp8x_metadata(chunk),
+            _ => {}
+        }
+
+        offset += chunk_len + (chunk_len % 2);
+    }
+
+    Err(ImageMetadataError::InvalidHeader(
+        "missing WebP image chunk".to_string(),
+    ))
+}
+
+fn read_webp_vp8_metadata(chunk: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if chunk.len() < 10 || chunk[3..6] != [0x9d, 0x01, 0x2a] {
+        return Err(ImageMetadataError::InvalidHeader(
+            "missing WebP VP8 frame header".to_string(),
+        ));
+    }
+    let width = u32::from(u16::from_le_bytes([chunk[6], chunk[7]]) & 0x3fff);
+    let height = u32::from(u16::from_le_bytes([chunk[8], chunk[9]]) & 0x3fff);
+    Ok(webp_metadata(width, height, "webp-vp8", 0))
+}
+
+fn read_webp_vp8l_metadata(chunk: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if chunk.len() < 5 || chunk[0] != 0x2f {
+        return Err(ImageMetadataError::InvalidHeader(
+            "missing WebP VP8L frame header".to_string(),
+        ));
+    }
+    let bits = u32::from_le_bytes([chunk[1], chunk[2], chunk[3], chunk[4]]);
+    let width = (bits & 0x3fff) + 1;
+    let height = ((bits >> 14) & 0x3fff) + 1;
+    let alpha_bits = if ((bits >> 28) & 0x01) == 1 { 8 } else { 0 };
+    Ok(webp_metadata(width, height, "webp-vp8l", alpha_bits))
+}
+
+fn read_webp_vp8x_metadata(chunk: &[u8]) -> Result<ImageMetadata, ImageMetadataError> {
+    if chunk.len() < 10 {
+        return Err(ImageMetadataError::InvalidHeader(
+            "truncated WebP VP8X chunk".to_string(),
+        ));
+    }
+    let alpha_bits = if (chunk[0] & 0x10) != 0 { 8 } else { 0 };
+    let width = read_webp_u24(&chunk[4..7]) + 1;
+    let height = read_webp_u24(&chunk[7..10]) + 1;
+    Ok(webp_metadata(width, height, "webp-extended", alpha_bits))
+}
+
+fn read_webp_u24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+fn webp_metadata(width: u32, height: u32, encoding: &str, alpha_bits: u32) -> ImageMetadata {
+    let bits_per_sample = 8;
+    let color_channels = 3;
+    ImageMetadata {
+        width,
+        height,
+        pixels: u64::from(width) * u64::from(height),
+        format: "WebP".to_string(),
+        encoding: encoding.to_string(),
+        bits_per_sample,
+        color_channels,
+        alpha_bits,
+        bits_per_pixel: bits_per_sample
+            .saturating_mul(color_channels)
+            .saturating_add(alpha_bits),
+    }
 }
 
 fn is_jxl_bytes(bytes: &[u8]) -> bool {
@@ -1349,7 +1449,9 @@ fn validate_encode_options(options: &EncodeOptions) -> Result<(), EncodeError> {
 /// Decodes a supported source image to RGBA8 pixels.
 #[cfg(feature = "jxl-encode-libjxl")]
 fn decode_source_image_rgba8(path: &Path) -> Result<RgbaImage, EncodeError> {
-    let image = image::ImageReader::open(path)
+    let file = File::open(path).map_err(EncodeError::Io)?;
+    let image = image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
         .map_err(EncodeError::Io)?
         .decode()
         .map_err(|error| EncodeError::DecodeImage(error.to_string()))?
@@ -1854,6 +1956,17 @@ mod tests {
         assert_eq!(jxl.format, "JPEG XL");
         assert_eq!(jxl.encoding, "jpeg-xl");
         assert_eq!(jxl.bits_per_sample, 8);
+
+        let webp = read_image_metadata(&[
+            b'R', b'I', b'F', b'F', 18, 0, 0, 0, b'W', b'E', b'B', b'P', b'V', b'P', b'8', b'X',
+            10, 0, 0, 0, 0, 0, 0, 0, 255, 3, 0, 166, 2, 0,
+        ])
+        .unwrap();
+        assert_eq!(webp.width, 1024);
+        assert_eq!(webp.height, 679);
+        assert_eq!(webp.format, "WebP");
+        assert_eq!(webp.encoding, "webp-extended");
+        assert_eq!(webp.bits_per_sample, 8);
     }
 
     #[test]
@@ -1962,5 +2075,23 @@ mod tests {
         assert!(decoded.height <= MAX_THUMBNAIL_DIMENSION);
         assert_eq!(decoded.pixels.len(), decoded.expected_len());
         assert_eq!(metadata.alpha_bits, 0);
+    }
+
+    #[cfg(feature = "jxl-encode-libjxl")]
+    #[test]
+    fn decodes_source_image_by_signature_instead_of_extension() {
+        let path = std::env::temp_dir().join("epc-image-jpeg-named-png.png");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jpeg"),
+        )
+        .unwrap();
+
+        let image = decode_source_image_rgba8(&path).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(image.width, 1100);
+        assert_eq!(image.height, 732);
+        assert_eq!(image.pixels.len(), image.expected_len());
     }
 }

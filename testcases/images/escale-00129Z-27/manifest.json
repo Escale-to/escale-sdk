@@ -1,0 +1,53 @@
+{
+  "epc_version": "1.0",
+  "profile": "core-format",
+  "type": "postcard",
+  "id": "escale:01KVZ9N8EAER2MXK450995FCK3",
+  "created_at": "2026-06-25T11:46:47Z",
+  "created_local_time": {
+    "time_zone": "Europe/Paris",
+    "utc_offset": "+02:00"
+  },
+  "sealed_at": "2026-06-25T11:46:54Z",
+  "author": {
+    "display_name": "GeeBe"
+  },
+  "content": {
+    "cover": {
+      "path": "media/cover.webp",
+      "mime": "image/webp",
+      "image": {
+        "width": 1845,
+        "height": 615,
+        "pixels": 1134675,
+        "format": "WebP",
+        "encoding": "webp-vp8",
+        "bits_per_sample": 8,
+        "color_channels": 3,
+        "alpha_bits": 0,
+        "bits_per_pixel": 24
+      }
+    },
+    "thumbnail": {
+      "path": "media/thumbnail.jxl",
+      "mime": "image/jxl",
+      "image": {
+        "width": 255,
+        "height": 85,
+        "pixels": 21675,
+        "format": "JPEG XL",
+        "encoding": "jpeg-xl",
+        "bits_per_sample": 8,
+        "color_channels": 3,
+        "alpha_bits": 0,
+        "bits_per_pixel": 24
+      }
+    },
+    "message": {
+      "path": "text/message.md",
+      "mime": "text/markdown",
+      "markdown_profile": "epc-markdown-core",
+      "markdown_profile_version": "1.0"
+    }
+  }
+}

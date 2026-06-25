@@ -1,0 +1,36 @@
+{
+  "signature_version": "1",
+  "payload": {
+    "context": "EPC-SIGNATURE-V1",
+    "card_id": "escale:01KVZ9KD1NPB4JR12J1AJE25K5",
+    "epc_version": "1.0",
+    "core_digest": "a6K1OA6hcP83gFalpiCbBPqlU6Ybcp49UNzdMsDt2Z0",
+    "hash_algorithm": "sha-256",
+    "signed_at": "2026-06-25T11:45:54Z",
+    "signer": {
+      "display_name": "GeeBe",
+      "role": "author"
+    },
+    "policy": {
+      "mode": "all",
+      "required_keys": [
+        {
+          "algorithm": "Ed25519",
+          "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4"
+        }
+      ]
+    }
+  },
+  "signatures": [
+    {
+      "algorithm": "Ed25519",
+      "key_id": "-qkpFnCW9P9DVLWX9TGoa8Qv67RsHaMqasEWWu4cT_4",
+      "public_key": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "Bd3l4qJSfzVJLcljsEwgcKokLA3acKMgKHnnS80qR6c"
+      },
+      "value": "nEJeqohTFW-7tRC9iDmm34ztK43XQV_dQbl5fHIo_F2256uyyn0lkImoDvxnS3WdCYaA7BdWS8FHTK3x0WMfAA"
+    }
+  ]
+}

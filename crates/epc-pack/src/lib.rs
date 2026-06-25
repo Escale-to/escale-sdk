@@ -245,7 +245,7 @@ pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, Pa
     }
     if !is_supported_cover_path(&request.cover_path) {
         return Err(PackError::InvalidFilenameMetadata(
-            "cover path must be media/cover.jpg, media/cover.jpeg, media/cover.png, or media/cover.jxl"
+            "cover path must be media/cover.jpg, media/cover.jpeg, media/cover.png, media/cover.webp, or media/cover.jxl"
                 .to_string(),
         ));
     }

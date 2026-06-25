@@ -111,7 +111,7 @@ fn main() -> ExitCode {
                 }
             }
             if !(2..=3).contains(&values.len()) {
-                eprintln!("usage: escale-epc create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.jxl> <author-display-name> [<message>] [--distance <n>|--quality <n>] [--effort <n>]");
+                eprintln!("usage: escale-epc create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.webp|cover.jxl> <author-display-name> [<message>] [--distance <n>|--quality <n>] [--effort <n>]");
                 return ExitCode::from(2);
             }
 
@@ -283,7 +283,7 @@ fn print_help() {
     println!("escale-epc {}", epc_core::EPC_VERSION_1_0);
     println!();
     println!("commands:");
-    println!("  create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.jxl> <author> [message]");
+    println!("  create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.webp|cover.jxl> <author> [message]");
     println!("                                      Create or reset an EPC draft from a prepared dir or cover image");
     println!("  validate <capsule.epc>               Validate a core-format EPC archive");
     println!("  validate-dir <unpacked-capsule-dir>  Validate an unpacked core-format capsule");
@@ -314,7 +314,7 @@ fn create_draft(
     }
     if !input.is_dir() {
         eprintln!(
-            "create expects an existing draft directory or a .jpg/.jpeg/.png/.jxl cover image: {}",
+            "create expects an existing draft directory or a .jpg/.jpeg/.png/.webp/.jxl cover image: {}",
             input.display()
         );
         return ExitCode::from(2);
@@ -355,10 +355,10 @@ fn create_draft_from_image(
             return ExitCode::from(2);
         }
     };
-    let cover_path = match cover_path_for_input(input) {
-        Some(path) => path,
-        None => {
-            eprintln!("unsupported cover image extension: {}", input.display());
+    let cover_path = match cover_path_for_source_image(input) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
             return ExitCode::from(2);
         }
     };
@@ -446,31 +446,37 @@ fn is_supported_create_image(path: &Path) -> bool {
             extension.eq_ignore_ascii_case("jpg")
                 || extension.eq_ignore_ascii_case("jpeg")
                 || extension.eq_ignore_ascii_case("png")
+                || extension.eq_ignore_ascii_case("webp")
                 || extension.eq_ignore_ascii_case("jxl")
         })
         .unwrap_or(false)
 }
 
-fn cover_path_for_input(path: &Path) -> Option<String> {
-    let extension = path.extension()?.to_str()?;
-    if extension.eq_ignore_ascii_case("jpg") {
-        Some("media/cover.jpg".to_string())
-    } else if extension.eq_ignore_ascii_case("jpeg") {
-        Some("media/cover.jpeg".to_string())
-    } else if extension.eq_ignore_ascii_case("png") {
-        Some("media/cover.png".to_string())
-    } else if extension.eq_ignore_ascii_case("jxl") {
-        Some(epc_core::COVER_PATH.to_string())
-    } else {
-        None
+fn cover_path_for_source_image(path: &Path) -> Result<String, String> {
+    let metadata = epc_image::read_image_metadata_file(path)
+        .map_err(|error| format!("failed to identify cover image format: {error:?}"))?;
+    match metadata.format.as_str() {
+        "JPEG" => {
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("jpeg")) {
+                Ok("media/cover.jpeg".to_string())
+            } else {
+                Ok("media/cover.jpg".to_string())
+            }
+        }
+        "PNG" => Ok("media/cover.png".to_string()),
+        "WebP" => Ok("media/cover.webp".to_string()),
+        "JPEG XL" => Ok(epc_core::COVER_PATH.to_string()),
+        format => Err(format!("unsupported cover image format: {format}")),
     }
 }
 
-fn supported_cover_paths() -> [&'static str; 4] {
+fn supported_cover_paths() -> [&'static str; 5] {
     [
         "media/cover.jpg",
         "media/cover.jpeg",
         "media/cover.png",
+        "media/cover.webp",
         epc_core::COVER_PATH,
     ]
 }
@@ -589,8 +595,8 @@ fn print_image_help() {
     eprintln!("  image info <image.jxl> [--kind cover|thumbnail]");
     eprintln!("  image validate <image.jxl> --kind cover|thumbnail");
     eprintln!("  image preview <image.jxl> --out <preview.png> [--max <px>] [--kind cover|thumbnail] [--force]");
-    eprintln!("  image encode <input.jpg|png> <output.jxl> --kind cover|thumbnail [--distance <n>|--quality <n>] [--effort <n>] [--force]");
-    eprintln!("  image prepare <input.jpg|jpeg|png|jxl> <draft-dir> [--distance <n>|--quality <n>] [--effort <n>] [--force]");
+    eprintln!("  image encode <input.jpg|png|webp> <output.jxl> --kind cover|thumbnail [--distance <n>|--quality <n>] [--effort <n>] [--force]");
+    eprintln!("  image prepare <input.jpg|jpeg|png|webp|jxl> <draft-dir> [--distance <n>|--quality <n>] [--effort <n>] [--force]");
 }
 
 fn image_info(args: Vec<String>) -> ExitCode {
@@ -825,7 +831,7 @@ fn image_encode(args: Vec<String>) -> ExitCode {
     }
 
     if values.len() != 2 || kind.is_none() {
-        eprintln!("usage: escale-epc image encode <input.jpg|png> <output.jxl> --kind cover|thumbnail [--force]");
+        eprintln!("usage: escale-epc image encode <input.jpg|png|webp> <output.jxl> --kind cover|thumbnail [--force]");
         return ExitCode::from(2);
     }
     let input = PathBuf::from(&values[0]);
@@ -894,16 +900,16 @@ fn image_prepare(args: Vec<String>) -> ExitCode {
     }
 
     if values.len() != 2 {
-        eprintln!("usage: escale-epc image prepare <input.jpg|jpeg|png|jxl> <draft-dir> [--force]");
+        eprintln!(
+            "usage: escale-epc image prepare <input.jpg|jpeg|png|webp|jxl> <draft-dir> [--force]"
+        );
         return ExitCode::from(2);
     }
 
     let input = PathBuf::from(&values[0]);
     let draft = PathBuf::from(&values[1]);
     match prepare_cover_image(&input, &draft, force, &options) {
-        Ok(()) => {
-            let cover_path =
-                cover_path_for_input(&input).unwrap_or_else(|| epc_core::COVER_PATH.to_string());
+        Ok(cover_path) => {
             println!("{}", draft.join(cover_path).display());
             println!("{}", draft.join(epc_core::THUMBNAIL_PATH).display());
             ExitCode::SUCCESS
@@ -920,13 +926,12 @@ fn prepare_cover_image(
     draft: &Path,
     force: bool,
     options: &epc_image::EncodeOptions,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let media_dir = draft.join("media");
     if let Err(error) = fs::create_dir_all(&media_dir) {
         return Err(format!("failed to create media directory: {error}"));
     }
-    let cover_path = cover_path_for_input(input)
-        .ok_or_else(|| format!("unsupported cover image extension: {}", input.display()))?;
+    let cover_path = cover_path_for_source_image(input)?;
     let cover = draft.join(&cover_path);
     let thumbnail = draft.join(epc_core::THUMBNAIL_PATH);
     if !force && (cover.exists() || thumbnail.exists()) {
@@ -944,7 +949,8 @@ fn prepare_cover_image(
     })?;
 
     epc_pack::refresh_manifest_image_metadata(draft)
-        .map_err(|error| format!("failed to update manifest image metadata: {error:?}"))
+        .map_err(|error| format!("failed to update manifest image metadata: {error:?}"))?;
+    Ok(cover_path)
 }
 
 fn encode_and_validate_file(
@@ -1044,6 +1050,22 @@ mod tests {
         assert!(is_supported_create_image(Path::new("cover.JPG")));
         assert!(is_supported_create_image(Path::new("cover.jpeg")));
         assert!(is_supported_create_image(Path::new("cover.PNG")));
+        assert!(is_supported_create_image(Path::new("cover.webp")));
         assert!(is_supported_create_image(Path::new("cover.jxl")));
+    }
+
+    #[test]
+    fn chooses_cover_path_from_image_signature_instead_of_extension() {
+        let path = std::env::temp_dir().join("epc-cli-jpeg-named-png.png");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jpeg"),
+        )
+        .unwrap();
+
+        let cover_path = cover_path_for_source_image(&path).unwrap();
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(cover_path, "media/cover.jpg");
     }
 }

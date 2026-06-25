@@ -64,17 +64,17 @@ préparé ou d'une image de couverture.
 escale-epc create photo.jpg "Alice" "Bonjour depuis Escale."
 ```
 
-Avec une image `.jpg`, `.jpeg`, `.png` ou `.jxl`, elle crée un dossier frère nommé
-`escale-TTTTTT-RR`, copie l'image sans modification dans `media/cover.*`, dérive
-`media/thumbnail.jxl`, écrit `manifest.json`, initialise `text/message.md` si
-absent, et supprime les preuves générées obsolètes.
+Avec une image `.jpg`, `.jpeg`, `.png`, `.webp` ou `.jxl`, elle crée un dossier
+frère nommé `escale-TTTTTT-RR`, copie l'image sans modification dans
+`media/cover.*`, dérive `media/thumbnail.jxl`, écrit `manifest.json`, initialise
+`text/message.md` si absent, et supprime les preuves générées obsolètes.
 
 `TTTTTT` correspond au `HHMMSS` local du device encodé en base36 sur six
 caractères ; `RR` est un suffixe court anti-collision.
 
 Avec un dossier, celui-ci doit déjà exister et contenir une image principale
-supportée : `media/cover.jpg`, `media/cover.jpeg`, `media/cover.png` ou
-`media/cover.jxl`.
+supportée : `media/cover.jpg`, `media/cover.jpeg`, `media/cover.png`,
+`media/cover.webp` ou `media/cover.jxl`.
 
 Si un message optionnel est fourni, il est écrit dans `text/message.md`. Sinon,
 le fichier est créé vide et peut être modifié avant le packing.
@@ -304,8 +304,8 @@ escale-epc image preview media/cover.jxl --out preview.png --force
 
 ## Encoder une image en JXL
 
-`image encode` convertit un JPEG ou PNG vers JPEG XL avec l'encodeur Rust du SDK,
-puis valide le résultat comme `cover` ou `thumbnail`.
+`image encode` convertit un JPEG, PNG ou WebP vers JPEG XL avec l'encodeur Rust
+du SDK, puis valide le résultat comme `cover` ou `thumbnail`.
 
 ```bash
 escale-epc image encode source.jpg media/cover.jxl --kind cover
@@ -342,11 +342,11 @@ escale-epc image prepare photo.jpg drafts/postcard-001
 La commande :
 
 1. crée `drafts/postcard-001/media` si nécessaire ;
-2. encode la source en `media/cover.jxl` ;
-3. décode la couverture en RGBA8 ;
+2. copie la source sans modification dans `media/cover.*` ;
+3. décode la couverture copiée en RGBA8 ;
 4. génère une miniature redimensionnée dans une boîte de 256x256 pixels ;
 5. encode cette miniature en `media/thumbnail.jxl` ;
-6. valide les deux fichiers JXL ;
+6. valide le thumbnail JXL ;
 7. affiche les deux chemins générés sur `stdout`.
 
 La miniature conserve le ratio de la couverture, n'est pas recadrée et n'est

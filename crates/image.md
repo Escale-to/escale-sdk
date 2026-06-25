@@ -473,7 +473,7 @@ utiliser `render_cover_from_directory_rgba8` ou
 Pour afficher une couverture ou une miniature depuis une archive `.epc`, utiliser
 `render_cover_from_epc_rgba8` ou `render_thumbnail_from_epc_rgba8`.
 
-Pour encoder un JPEG ou PNG en JXL, activer `jxl-encode-libjxl` et
+Pour encoder un JPEG, PNG ou WebP en JXL, activer `jxl-encode-libjxl` et
 utiliser `encode_jpeg_file_to_jxl_file`, `encode_png_file_to_jxl_file` ou
 `encode_file_to_jxl_file`.
 

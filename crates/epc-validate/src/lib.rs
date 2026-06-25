@@ -1193,7 +1193,7 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
                 IssueSeverity::Error,
                 "EPC_MANIFEST_UNEXPECTED_CONTENT_PATH",
                 "Unexpected content path",
-                "content.cover.path must be media/cover.jpg, media/cover.jpeg, media/cover.png, or media/cover.jxl.",
+                "content.cover.path must be media/cover.jpg, media/cover.jpeg, media/cover.png, media/cover.webp, or media/cover.jxl.",
             )
             .with_file(MANIFEST_PATH)
             .with_pointer("#/content/cover/path"),
@@ -2028,6 +2028,21 @@ mod tests {
             "escale:00000000000000000000000000",
             "media/cover.jpg",
             include_bytes!("../../../testcases/images/tour-eiffel.jpg"),
+        );
+
+        let report = validate_core_directory(root.path());
+
+        assert!(report.is_valid(), "{report:#?}");
+    }
+
+    #[test]
+    fn validates_minimal_core_directory_with_webp_cover() {
+        let root = TestDir::new();
+        write_minimal_capsule_with_cover(
+            root.path(),
+            "escale:00000000000000000000000000",
+            "media/cover.webp",
+            b"RIFF\x10\x00\x00\x00WEBPVP8 ",
         );
 
         let report = validate_core_directory(root.path());
