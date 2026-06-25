@@ -183,11 +183,13 @@ println!("thumbnail pixels max: {MAX_THUMBNAIL_PIXELS}");
 println!("thumbnail side max: {MAX_THUMBNAIL_DIMENSION}");
 ```
 
-Un thumbnail EPC est dérivé de `media/cover.jxl` par redimensionnement dans une
-boîte maximale de 256x256 pixels. Le ratio d'origine est conservé, l'image
-n'est pas recadrée et elle n'est pas agrandie si elle tient déjà dans cette
-boîte. Les limites normatives associées sont donc 1024 pixels par côté et
-256 * 256 pixels décodés au maximum.
+Un thumbnail EPC est dérivé de l'image principale déclarée par
+`content.cover.path` (`media/cover.jpg`, `media/cover.jpeg`,
+`media/cover.png`, `media/cover.webp` ou `media/cover.jxl`) par
+redimensionnement dans une boîte maximale de 256x256 pixels. Le ratio d'origine
+est conservé, l'image n'est pas recadrée et elle n'est pas agrandie si elle
+tient déjà dans cette boîte. Les limites normatives associées sont donc
+1024 pixels par côté et 256 * 256 pixels décodés au maximum.
 
 Les limites Markdown sont utilisées par le validateur du message :
 

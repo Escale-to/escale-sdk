@@ -75,7 +75,7 @@ Le dossier doit avoir la même structure qu'une archive EPC à sa racine :
 
 ```text
 manifest.json
-media/cover.jxl
+media/cover.{jpg|jpeg|png|webp|jxl}
 media/thumbnail.jxl
 text/message.md
 proof/hashes.json
@@ -375,9 +375,9 @@ Le validateur contrôle notamment :
 - la taille totale ;
 - les fichiers de contenu vides, qui produisent des warnings.
 
-Les fichiers vides `media/cover.jxl`, `media/thumbnail.jxl` et
-`text/message.md` produisent des warnings, pas des erreurs, lorsque leur
-présence est autrement conforme.
+Une cover vide supportée, `media/thumbnail.jxl` et `text/message.md`
+produisent des warnings, pas des erreurs, lorsque leur présence est autrement
+conforme.
 
 ## Validation du manifest
 
@@ -416,7 +416,7 @@ images à `epc-image`.
 
 Les fichiers concernés sont :
 
-- `media/cover.jxl` ;
+- `media/cover.jxl`, uniquement lorsque la cover déclarée est JPEG XL ;
 - `media/thumbnail.jxl`.
 
 Le validateur vérifie alors la signature et la décodabilité du JPEG XL, ainsi
@@ -430,7 +430,7 @@ pas compilée.
 `proof/hashes.json` doit décrire les fichiers immuables du coeur EPC :
 
 - `manifest.json` avec transform `jcs` ;
-- `media/cover.jxl` avec transform `identity` ;
+- la cover déclarée par `manifest.content.cover.path` avec transform `identity` ;
 - `media/thumbnail.jxl` avec transform `identity` ;
 - `text/message.md` avec transform `identity`.
 

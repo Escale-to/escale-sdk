@@ -2215,7 +2215,7 @@ mod tests {
         .unwrap();
         fs::write(root.join(cover_path), cover_bytes).unwrap();
         write_sample_thumbnail_jxl(root);
-        fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
+        fs::write(root.join(MESSAGE_PATH), "Hello **Escale**.\n").unwrap();
 
         let entries = [MANIFEST_PATH, cover_path, THUMBNAIL_PATH, MESSAGE_PATH]
             .into_iter()

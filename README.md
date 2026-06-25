@@ -42,7 +42,7 @@ Available commands:
 ```sh
 cargo run -p epc-cli -- validate <capsule.epc>
 cargo run -p epc-cli -- validate-dir <unpacked-capsule-dir>
-cargo run -p epc-cli -- create [--force] <draft-dir|cover.jpg|cover.png|cover.webp> <author-display-name> [<message>]
+cargo run -p epc-cli -- create [--force] <draft-dir|cover.jpg|cover.jpeg|cover.png|cover.webp|cover.jxl> <author-display-name> [<message>]
 cargo run -p epc-cli -- image info <image.jxl> [--kind cover|thumbnail]
 cargo run -p epc-cli -- image validate <image.jxl> --kind cover|thumbnail
 cargo run -p epc-cli -- image preview <image.jxl> --out <preview.png> [--max <px>]
@@ -84,7 +84,7 @@ let image = epc_image::RgbaImage {
 
 epc_image::encode_rgba8_to_jxl_file(
     &image,
-    "media/cover.jxl",
+    "media/cover.{jpg|jpeg|png|webp|jxl}",
     &epc_image::EncodeOptions::default(),
 )?;
 ```
@@ -92,7 +92,7 @@ epc_image::encode_rgba8_to_jxl_file(
 Capsule creation:
 
 ```sh
-cargo run -p epc-cli -- create ../photo.jpg "Bruno" "Bonjour depuis Escale."
+cargo run -p epc-cli -- create ../photo.jpg "Bruno" "Hello from Escale."
 ```
 
 This creates:
@@ -101,7 +101,7 @@ This creates:
 escale-TTTTTT-RR/
   manifest.json
   media/
-    cover.jxl
+    cover.{jpg|jpeg|png|webp|jxl}
     thumbnail.jxl
   text/
     message.md

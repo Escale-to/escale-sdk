@@ -12,6 +12,6 @@ path = "src/main.rs"
 [dependencies]
 epc-core.workspace = true
 epc-image = { workspace = true, features = ["jxl-encode-libjxl"] }
-epc-pack.workspace = true
+epc-pack = { workspace = true, features = ["test-vectors"] }
 epc-validate.workspace = true
 serde_json.workspace = true

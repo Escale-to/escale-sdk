@@ -168,7 +168,10 @@ Le mode `fit` conserve le ratio d'origine et ne force pas d'agrandissement si
 l'image tient déjà dans la taille demandée. Les dimensions maximales doivent
 être strictement supérieures à zéro.
 
-Pour générer le thumbnail canonique d'un EPC, partir de `media/cover.jxl` :
+Pour générer le thumbnail canonique depuis une cover JPEG XL, partir de
+`media/cover.jxl`. Les covers JPG, PNG et WebP sont prises en charge par les
+commandes de création/préparation du SDK, qui produisent ensuite
+`media/thumbnail.jxl` :
 
 ```rust
 use epc_image::{
@@ -440,7 +443,8 @@ Les cas importants sont :
 
 - `Io` : erreur de lecture ;
 - `InvalidZip` : l'archive `.epc` n'est pas un ZIP valide ;
-- `MissingImage` : `media/cover.jxl` ou `media/thumbnail.jxl` est absent ;
+- `MissingImage` : l'image principale déclarée ou `media/thumbnail.jxl` est
+  absente ;
 - `Jxl` : erreur de validation ou de décodage JPEG XL ;
 - `ImageTooLarge` : l'allocation nécessaire serait trop grande ;
 - `UnsupportedChannelCount` : le décodeur a retourné un layout de canaux non

@@ -66,7 +66,8 @@ preuves générées obsolètes `proof/hashes.json` et `proof/signature.json`.
 
 Elle ne crée pas automatiquement les images. L'application doit ensuite écrire :
 
-- `media/cover.jxl`
+- une image principale supportée : `media/cover.jpg`, `media/cover.jpeg`,
+  `media/cover.png`, `media/cover.webp` ou `media/cover.jxl`
 - `media/thumbnail.jxl`
 - `text/message.md`
 
@@ -165,7 +166,8 @@ le ZIP final.
 Le dossier source doit contenir au minimum :
 
 - `manifest.json`
-- `media/cover.jxl`
+- une image principale supportée : `media/cover.jpg`, `media/cover.jpeg`,
+  `media/cover.png`, `media/cover.webp` ou `media/cover.jxl`
 - `media/thumbnail.jxl`
 - `text/message.md`
 

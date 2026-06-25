@@ -2023,7 +2023,7 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
     match kind {
         MessageKind::Max => write_max_markdown(&root.join(MESSAGE_PATH))?,
         MessageKind::Minimal | MessageKind::UnsupportedMarkdownProfile => {
-            fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n")?;
+            fs::write(root.join(MESSAGE_PATH), "Hello **Escale**.\n")?;
         }
     }
 
@@ -2264,13 +2264,13 @@ mod tests {
     fn create_keeps_existing_message_file() {
         let draft = TestDir::new();
         fs::create_dir_all(draft.path().join("text")).unwrap();
-        fs::write(draft.path().join(MESSAGE_PATH), "Bonjour deja la.\n").unwrap();
+        fs::write(draft.path().join(MESSAGE_PATH), "Already here.\n").unwrap();
 
         let request = CreateDraftRequest::new(draft.path(), "Bruno");
         create_draft_directory(request).unwrap();
 
         let message = fs::read_to_string(draft.path().join(MESSAGE_PATH)).unwrap();
-        assert_eq!(message, "Bonjour deja la.\n");
+        assert_eq!(message, "Already here.\n");
         assert!(draft.path().join(MANIFEST_PATH).exists());
     }
 
@@ -2368,7 +2368,7 @@ mod tests {
         )
         .unwrap();
         write_sample_jxl_files(source.path()).unwrap();
-        fs::write(source.path().join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
+        fs::write(source.path().join(MESSAGE_PATH), "Hello **Escale**.\n").unwrap();
 
         let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
         let manifest_after_pack = read_manifest(source.path());
@@ -2661,7 +2661,7 @@ mod tests {
         )
         .unwrap();
         write_sample_jxl_files(root).unwrap();
-        fs::write(root.join(MESSAGE_PATH), "Bonjour **Escale**.\n").unwrap();
+        fs::write(root.join(MESSAGE_PATH), "Hello **Escale**.\n").unwrap();
     }
 
     fn read_manifest(root: &Path) -> Manifest {

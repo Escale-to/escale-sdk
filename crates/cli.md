@@ -367,8 +367,8 @@ Exemple :
 escale-epc image prepare photo.jpg drafts/postcard-001 --distance 0 --effort 7
 ```
 
-Si `media/cover.jxl` ou `media/thumbnail.jxl` existe déjà, la commande échoue
-sauf avec `--force`.
+Si une image principale supportée `media/cover.*` ou `media/thumbnail.jxl`
+existe déjà, la commande échoue sauf avec `--force`.
 
 ## Générer les vecteurs de conformité
 
@@ -410,7 +410,7 @@ escale-epc pack --sign keys/author_ed25519 drafts/postcard-001 dist
 
 Pour créer un dossier de travail, utiliser `create`.
 
-Pour préparer `cover.jxl` et `thumbnail.jxl`, utiliser `image prepare`.
+Pour préparer une cover acceptée et `thumbnail.jxl`, utiliser `image prepare`.
 
 Pour contrôler une image seule, utiliser `image info` ou `image validate`.
 
