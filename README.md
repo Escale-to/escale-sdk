@@ -49,7 +49,7 @@ cargo run -p epc-cli -- image preview <image.jxl> --out <preview.png> [--max <px
 cargo run -p epc-cli -- image encode <input.jpg|png|webp> <output.jxl> --kind cover|thumbnail
 cargo run -p epc-cli -- image prepare <input.jpg|png|webp> <draft-dir>
 cargo run -p epc-cli -- sign --ssh-key <ssh-ed25519-key> <source-dir>
-cargo run -p epc-cli -- pack <source-dir> [output-dir]
+cargo run -p epc-cli -- pack [--issued] <source-dir> [output-dir]
 cargo run -p epc-cli -- pack --sign <ssh-ed25519-key> <source-dir> [output-dir]
 cargo run -p epc-cli -- generate-test-vectors ../escale-design/test-vectors/core-format
 ```
@@ -122,11 +122,11 @@ packing.
 No need to create `proof/hashes.json` because `pack` generates it
 automatically before writing the `.epc` file.
 
-`create` initializes an unpacked draft tree. The ADR-003 filename for an
-exported or stored draft is:
+`create` initializes an unpacked draft tree. Drafts are directories, not `.epc`
+files. The reference CLI uses draft directory names such as:
 
 ```text
-escale-<ID10>.epc
+escale-<TIME6>-<RAND2>/
 ```
 
 `pack` takes an optional output directory, not an output filename. When omitted,
@@ -151,11 +151,17 @@ building the `CreateDraftRequest`; the reference CLI uses best-effort host
 detection.
 
 When using `pack`, `created_at` and `created_local_time` are kept as the
-draft/card creation metadata. If `sealed_at` is empty, it is written by the
-packer at sealing time, before `proof/hashes.json` and the filename are
-generated. If `sealed_at` is already present, `pack` keeps it unchanged so
-repeated packs produce the same ADR-003 filename. `pack` refuses to overwrite an
-existing `.epc` archive.
+draft/card creation metadata. Draft manifests use `"status": "draft"` and an
+empty `sealed_at`. By default, `pack` writes `"status": "sealed"` and sets
+`sealed_at` before `proof/hashes.json` and the filename are generated. If
+`sealed_at` is already present, `pack` keeps it unchanged so repeated packs
+produce the same ADR-003 filename. `pack` refuses to overwrite an existing
+`.epc` archive.
+
+For cards handed to the Escale travel infrastructure, use `pack --issued`.
+Issued cards use `"status": "issued"`, keep `sealed_at` empty, and are written
+with an `escale-<ID10>.epc` filename. They are locked for the public SDK; final
+sealing is left to the travel infrastructure.
 
 Authenticity is added with `sign`, which writes `proof/signature.json`:
 
@@ -204,6 +210,7 @@ Minimal `manifest.json` file:
     "time_zone": "Europe/Paris",
     "utc_offset": "+02:00"
   },
+  "status": "draft",
   "sealed_at": "",
   "author": {
     "display_name": "Bruno"

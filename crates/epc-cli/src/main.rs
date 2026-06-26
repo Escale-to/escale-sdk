@@ -126,23 +126,26 @@ fn main() -> ExitCode {
         Some("pack") => {
             let mut signing_key = None;
             let mut force_signature = false;
+            let mut issued = false;
             let mut values = Vec::new();
             while let Some(arg) = args.next() {
                 if arg == "--sign" {
                     let Some(value) = args.next() else {
-                        eprintln!("usage: escale-epc pack [--sign <ssh-ed25519-key>] [--force] <source-dir> [output-dir]");
+                        eprintln!("usage: escale-epc pack [--issued] [--sign <ssh-ed25519-key>] [--force] <source-dir> [output-dir]");
                         return ExitCode::from(2);
                     };
                     signing_key = Some(PathBuf::from(value));
                 } else if arg == "--force" {
                     force_signature = true;
+                } else if arg == "--issued" {
+                    issued = true;
                 } else {
                     values.push(arg);
                 }
             }
             if values.is_empty() || values.len() > 2 {
                 eprintln!(
-                    "usage: escale-epc pack [--sign <ssh-ed25519-key>] [--force] <source-dir> [output-dir]"
+                    "usage: escale-epc pack [--issued] [--sign <ssh-ed25519-key>] [--force] <source-dir> [output-dir]"
                 );
                 return ExitCode::from(2);
             }
@@ -150,20 +153,43 @@ fn main() -> ExitCode {
                 eprintln!("--force can only be used with pack --sign");
                 return ExitCode::from(2);
             }
+            if issued && signing_key.is_some() {
+                eprintln!("--issued cannot be used with pack --sign");
+                return ExitCode::from(2);
+            }
             let source_dir = values[0].clone();
+            let source_path = Path::new(&source_dir);
+            if !source_path.is_dir() {
+                if is_epc_archive_path(source_path) {
+                    eprintln!(
+                        "pack expects an unpacked EPC source directory, not a .epc archive: {}",
+                        source_path.display()
+                    );
+                } else {
+                    eprintln!(
+                        "pack source must be an unpacked EPC directory: {}",
+                        source_path.display()
+                    );
+                }
+                return ExitCode::from(2);
+            }
             let output_dir = values
                 .get(1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_pack_output_dir(&source_dir));
 
-            let result = match signing_key {
-                Some(signing_key) => epc_pack::pack_core_format_to_directory_signed(
-                    source_dir,
-                    output_dir,
-                    signing_key,
-                    force_signature,
-                ),
-                None => epc_pack::pack_core_format_to_directory(source_dir, output_dir),
+            let result = if issued {
+                epc_pack::pack_core_format_to_directory_issued(source_dir, output_dir)
+            } else {
+                match signing_key {
+                    Some(signing_key) => epc_pack::pack_core_format_to_directory_signed(
+                        source_dir,
+                        output_dir,
+                        signing_key,
+                        force_signature,
+                    ),
+                    None => epc_pack::pack_core_format_to_directory(source_dir, output_dir),
+                }
             };
 
             match result {
@@ -184,6 +210,10 @@ fn main() -> ExitCode {
                     eprintln!(
                         "failed to pack capsule: output file already exists; refusing to overwrite"
                     );
+                    ExitCode::from(2)
+                }
+                Err(epc_pack::PackError::SealedSource(message)) => {
+                    eprintln!("failed to pack capsule: {message}");
                     ExitCode::from(2)
                 }
                 Err(error) => {
@@ -242,6 +272,10 @@ fn main() -> ExitCode {
                     );
                     ExitCode::from(2)
                 }
+                Err(epc_pack::PackError::SealedSource(message)) => {
+                    eprintln!("failed to sign capsule: {message}");
+                    ExitCode::from(2)
+                }
                 Err(error) => {
                     eprintln!("failed to sign capsule: {error:?}");
                     ExitCode::from(2)
@@ -287,8 +321,8 @@ fn print_help() {
     println!("                                      Create or reset an EPC draft from a prepared dir or cover image");
     println!("  validate <capsule.epc>               Validate a core-format EPC archive");
     println!("  validate-dir <unpacked-capsule-dir>  Validate an unpacked core-format capsule");
-    println!("  pack [--sign <ssh-key>] [--force] <source-dir> [output-dir]");
-    println!("                                      Pack, optionally signing with an SSH key");
+    println!("  pack [--issued] [--sign <ssh-key>] [--force] <source-dir> [output-dir]");
+    println!("                                      Pack sealed by default, or issued for travel handoff");
     println!("  sign [--force] --ssh-key <ssh-key> <source-dir>");
     println!("                                      Write proof/signature.json with Ed25519");
     println!("  image <command> ...                  Inspect, preview, encode, or prepare JXL");
@@ -449,6 +483,13 @@ fn is_supported_create_image(path: &Path) -> bool {
                 || extension.eq_ignore_ascii_case("webp")
                 || extension.eq_ignore_ascii_case("jxl")
         })
+        .unwrap_or(false)
+}
+
+fn is_epc_archive_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("epc"))
         .unwrap_or(false)
 }
 

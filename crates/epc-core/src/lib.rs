@@ -167,6 +167,10 @@ pub struct Manifest {
     /// Device-local creation context captured when the draft was created.
     pub created_local_time: CreatedLocalTime,
 
+    /// Lifecycle state for the EPC manifest.
+    #[serde(default)]
+    pub status: ManifestStatus,
+
     /// Capsule sealing timestamp in UTC RFC 3339 form.
     pub sealed_at: String,
 
@@ -175,6 +179,21 @@ pub struct Manifest {
 
     /// Required readable capsule content.
     pub content: Content,
+}
+
+/// EPC manifest lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestStatus {
+    /// Editable authoring state before packaging.
+    #[default]
+    Draft,
+
+    /// Locked handoff state for the Escale travel infrastructure.
+    Issued,
+
+    /// Final immutable state after delivery.
+    Sealed,
 }
 
 /// Device-local creation time metadata declared by the manifest.

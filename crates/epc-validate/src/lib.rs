@@ -23,9 +23,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use epc_core::{
     cover_mime_for_path, expected_file_size_limit, is_allowed_regular_file,
     is_expected_hashed_core_file, is_safe_core_path, is_supported_cover_path, is_valid_card_id,
-    HashEntry, HashTransform, Hashes, Manifest, SignatureProof, CORE_DOMAIN_SEPARATOR,
-    CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0, HASHES_PATH,
-    HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
+    HashEntry, HashTransform, Hashes, Manifest, ManifestStatus, SignatureProof,
+    CORE_DOMAIN_SEPARATOR, CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0,
+    HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
     MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE, MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS,
     MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_ZIP_ENTRIES, MESSAGE_PATH,
     SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
@@ -1030,7 +1030,24 @@ fn read_manifest(root: &Path, report: &mut ValidationReport) -> Option<Manifest>
         }
     };
 
-    match serde_json::from_slice(&bytes) {
+    let mut value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_MANIFEST_INVALID_JSON",
+                    "Invalid manifest JSON",
+                    format!("manifest.json is not valid EPC manifest JSON: {error}."),
+                )
+                .with_file(MANIFEST_PATH),
+            );
+            return None;
+        }
+    };
+    complete_manifest_status_default(&mut value);
+
+    match serde_json::from_value(value) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
             report.push(
@@ -1045,6 +1062,27 @@ fn read_manifest(root: &Path, report: &mut ValidationReport) -> Option<Manifest>
             None
         }
     }
+}
+
+fn complete_manifest_status_default(value: &mut Value) {
+    let Value::Object(object) = value else {
+        return;
+    };
+    if object.contains_key("status") {
+        return;
+    }
+    let sealed_at = object
+        .get("sealed_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    object.insert(
+        "status".to_string(),
+        Value::String(if sealed_at.is_empty() {
+            "draft".to_string()
+        } else {
+            "sealed".to_string()
+        }),
+    );
 }
 
 fn read_hashes(root: &Path, report: &mut ValidationReport) -> Option<Hashes> {
@@ -1164,6 +1202,7 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         );
     }
 
+    validate_manifest_status(manifest, report);
     validate_created_local_time(manifest, report);
 
     if manifest.author.display_name.trim().is_empty() {
@@ -1229,6 +1268,36 @@ fn validate_manifest(manifest: &Manifest, report: &mut ValidationReport) {
         "#/content/message/markdown_profile_version",
         report,
     );
+}
+
+fn validate_manifest_status(manifest: &Manifest, report: &mut ValidationReport) {
+    match manifest.status {
+        ManifestStatus::Draft | ManifestStatus::Issued if !manifest.sealed_at.is_empty() => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_MANIFEST_INVALID_STATUS",
+                    "Invalid manifest status",
+                    "draft and issued manifests must not set sealed_at.",
+                )
+                .with_file(MANIFEST_PATH)
+                .with_pointer("#/sealed_at"),
+            );
+        }
+        ManifestStatus::Sealed if manifest.sealed_at.is_empty() => {
+            report.push(
+                ValidationIssue::new(
+                    IssueSeverity::Error,
+                    "EPC_MANIFEST_INVALID_STATUS",
+                    "Invalid manifest status",
+                    "sealed manifests must set sealed_at.",
+                )
+                .with_file(MANIFEST_PATH)
+                .with_pointer("#/sealed_at"),
+            );
+        }
+        _ => {}
+    }
 }
 
 fn validate_created_local_time(manifest: &Manifest, report: &mut ValidationReport) {

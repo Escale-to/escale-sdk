@@ -293,6 +293,7 @@ use epc_core::{
     Content,
     CreatedLocalTime,
     Manifest,
+    ManifestStatus,
     MediaContent,
     MessageContent,
     CORE_PROFILE,
@@ -315,6 +316,7 @@ let manifest = Manifest {
         time_zone: "Europe/Paris".to_string(),
         utc_offset: "+02:00".to_string(),
     },
+    status: ManifestStatus::Sealed,
     sealed_at: "2026-06-23T10:05:00Z".to_string(),
     author: Author {
         display_name: "Alice".to_string(),

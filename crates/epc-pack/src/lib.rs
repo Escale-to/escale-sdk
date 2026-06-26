@@ -20,8 +20,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use epc_core::{
     cover_mime_for_path, is_supported_cover_path, is_valid_card_id, CreatedLocalTime, HashEntry,
-    HashTransform, Hashes, Manifest, SignatureEntry, SignaturePayload, SignaturePolicy,
-    SignatureProof, SignaturePublicKey, SignatureRequiredKey, SignatureSigner,
+    HashTransform, Hashes, Manifest, ManifestStatus, SignatureEntry, SignaturePayload,
+    SignaturePolicy, SignatureProof, SignaturePublicKey, SignatureRequiredKey, SignatureSigner,
     CORE_DOMAIN_SEPARATOR, COVER_PATH, HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1,
     MANIFEST_PATH, MAX_COVER_SIZE, MAX_MESSAGE_SIZE, MESSAGE_PATH, SIGNATURE_DOMAIN_SEPARATOR,
     SIGNATURE_PATH, THUMBNAIL_PATH,
@@ -107,6 +107,19 @@ pub struct PackRequest {
 
     /// Destination `.epc` archive path.
     pub output_file: PathBuf,
+
+    /// Lifecycle state to write into the packed archive.
+    pub mode: PackMode,
+}
+
+/// Lifecycle state produced by EPC packing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackMode {
+    /// Produce a final immutable EPC archive.
+    Sealed,
+
+    /// Produce an issued handoff archive for the Escale travel infrastructure.
+    Issued,
 }
 
 /// Request to sign an unpacked EPC source directory.
@@ -163,7 +176,14 @@ impl PackRequest {
         Self {
             source_dir: source_dir.into(),
             output_file: output_file.into(),
+            mode: PackMode::Sealed,
         }
+    }
+
+    /// Sets the lifecycle state written into the packed archive.
+    pub fn with_mode(mut self, mode: PackMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Returns the source directory.
@@ -182,6 +202,9 @@ impl PackRequest {
 pub enum PackError {
     /// The staged capsule failed validation before ZIP assembly.
     InvalidSource(ValidationReport),
+
+    /// The operation would modify an already sealed EPC source directory.
+    SealedSource(String),
 
     /// The manifest cannot produce an ADR-003 sealed capsule filename.
     InvalidFilenameMetadata(String),
@@ -234,6 +257,7 @@ fn pack_error_to_io(error: PackError) -> io::Error {
 /// are overwritten only when `force` is set.
 pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, PackError> {
     let root = request.output_dir;
+    ensure_manifest_is_not_sealed(&root, "create draft")?;
     let id = match request.id {
         Some(id) => id,
         None => generate_card_id()?,
@@ -260,6 +284,7 @@ pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, Pa
         id,
         created_at: current_utc_timestamp()?,
         created_local_time: request.created_local_time,
+        status: ManifestStatus::Draft,
         sealed_at: String::new(),
         author: epc_core::Author {
             display_name: request.author_display_name,
@@ -280,10 +305,11 @@ pub fn create_draft_directory(request: CreateDraftRequest) -> Result<PathBuf, Pa
     Ok(root)
 }
 
-/// Returns the ADR-003 draft filename for an unpacked draft directory.
+/// Returns the legacy short EPC filename for an unpacked draft directory.
 ///
 /// The filename has the form `escale-<ID10>.epc`, derived from
-/// `manifest.json` `id`.
+/// `manifest.json` `id`. Drafts are normally unpacked directories; the same
+/// filename form is now used for issued handoff archives.
 pub fn draft_filename_from_directory(root: impl AsRef<Path>) -> Result<String, PackError> {
     let bytes = fs::read(root.as_ref().join(MANIFEST_PATH))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
@@ -297,6 +323,7 @@ pub fn draft_filename_from_directory(root: impl AsRef<Path>) -> Result<String, P
 /// return an error so callers can report the failed insertion.
 pub fn refresh_manifest_image_metadata(root: impl AsRef<Path>) -> Result<(), PackError> {
     let root = root.as_ref();
+    ensure_manifest_is_not_sealed(root, "refresh image metadata")?;
     let mut manifest = read_manifest(root)?;
     refresh_manifest_image_metadata_fields(root, &mut manifest)?;
     write_manifest(root, &manifest)
@@ -308,6 +335,7 @@ pub fn refresh_manifest_image_metadata(root: impl AsRef<Path>) -> Result<(), Pac
 /// Ed25519 signature covers `UTF8("EPC-SIGNATURE-V1\n") || JCS(payload)`.
 pub fn sign_core_format_directory(request: SignRequest) -> Result<PathBuf, PackError> {
     let source_dir = request.source_dir.clone();
+    ensure_manifest_is_not_sealed(&source_dir, "sign capsule")?;
     let output_file = source_dir.join(SIGNATURE_PATH);
     if output_file.exists() && !request.force {
         return Err(PackError::Io(io::Error::new(
@@ -366,6 +394,7 @@ pub fn sign_core_format_directory_with_ssh_key(
 pub fn pack_core_format(request: PackRequest) -> Result<(), PackError> {
     let staging = TempDir::new("epc-pack");
     copy_core_source(request.source_dir(), staging.path())?;
+    prepare_manifest_for_pack(staging.path(), request.mode)?;
     write_hashes(staging.path())?;
 
     let report = validate_core_directory(staging.path());
@@ -388,22 +417,45 @@ pub fn pack_core_format_to_directory(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, PackError> {
-    pack_core_format_to_directory_with_options(source_dir, output_dir, ValidationOptions::default())
+    pack_core_format_to_directory_with_options(
+        source_dir,
+        output_dir,
+        PackMode::Sealed,
+        ValidationOptions::default(),
+    )
+}
+
+/// Packs a source directory into `output_dir` as an issued handoff archive.
+///
+/// The source must still be a draft. The packed archive and source manifest are
+/// moved to `issued` without setting `sealed_at`; final sealing remains the
+/// responsibility of the Escale travel infrastructure.
+pub fn pack_core_format_to_directory_issued(
+    source_dir: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+) -> Result<PathBuf, PackError> {
+    pack_core_format_to_directory_with_options(
+        source_dir,
+        output_dir,
+        PackMode::Issued,
+        ValidationOptions::default(),
+    )
 }
 
 fn pack_core_format_to_directory_with_options(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
+    mode: PackMode,
     validation_options: ValidationOptions,
 ) -> Result<PathBuf, PackError> {
     let source_dir = source_dir.as_ref();
     let output_dir = output_dir.as_ref();
     let staging = TempDir::new("epc-pack");
     copy_core_source(source_dir, staging.path())?;
-    let sealed_manifest = seal_manifest_if_needed(staging.path())?;
+    let packed_manifest = prepare_manifest_for_pack(staging.path(), mode)?;
     write_hashes(staging.path())?;
 
-    let output_file = output_dir.join(sealed_filename_from_manifest(staging.path())?);
+    let output_file = output_dir.join(packed_filename_from_manifest(staging.path(), mode)?);
     if output_file.exists() {
         return Err(PackError::Io(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -416,7 +468,9 @@ fn pack_core_format_to_directory_with_options(
         return Err(PackError::InvalidSource(report));
     }
 
-    write_manifest(source_dir, &sealed_manifest)?;
+    if source_needs_pack_status_update(source_dir, mode)? {
+        write_manifest(source_dir, &packed_manifest)?;
+    }
     write_zip(staging.path(), &output_file)?;
     Ok(output_file)
 }
@@ -438,17 +492,97 @@ pub fn pack_core_format_to_directory_signed(
     } else {
         ValidationOptions::default()
     };
-    pack_core_format_to_directory_with_options(source_dir, output_dir, validation_options)
+    pack_core_format_to_directory_with_options(
+        source_dir,
+        output_dir,
+        PackMode::Sealed,
+        validation_options,
+    )
 }
 
 fn seal_manifest_if_needed(root: &Path) -> Result<Manifest, PackError> {
-    let path = root.join(MANIFEST_PATH);
     let mut manifest = read_manifest(root)?;
+    seal_manifest(&mut manifest)?;
+    write_manifest(root, &manifest)?;
+    Ok(manifest)
+}
+
+fn ensure_manifest_is_not_sealed(root: &Path, operation: &str) -> Result<(), PackError> {
+    let manifest_path = root.join(MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+
+    let bytes = fs::read(manifest_path)?;
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let sealed_at = value
+        .get("sealed_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(status, "issued" | "sealed") || !sealed_at.is_empty() {
+        Err(PackError::SealedSource(format!(
+            "cannot {operation}: EPC source is already issued or sealed"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_manifest_for_pack(root: &Path, mode: PackMode) -> Result<Manifest, PackError> {
+    let mut manifest = read_manifest(root)?;
+    match mode {
+        PackMode::Sealed => {
+            if manifest.status == ManifestStatus::Issued {
+                return Err(PackError::SealedSource(
+                    "cannot seal capsule: EPC source is already issued".to_string(),
+                ));
+            }
+            seal_manifest(&mut manifest)?;
+        }
+        PackMode::Issued => {
+            if manifest.status != ManifestStatus::Draft || !manifest.sealed_at.is_empty() {
+                return Err(PackError::SealedSource(
+                    "cannot issue capsule: EPC source is already issued or sealed".to_string(),
+                ));
+            }
+            manifest.status = ManifestStatus::Issued;
+            manifest.sealed_at.clear();
+        }
+    }
+    write_manifest(root, &manifest)?;
+    Ok(manifest)
+}
+
+fn seal_manifest(manifest: &mut Manifest) -> Result<(), PackError> {
+    if manifest.status == ManifestStatus::Issued {
+        return Err(PackError::SealedSource(
+            "cannot seal capsule: EPC source is already issued".to_string(),
+        ));
+    }
+    manifest.status = ManifestStatus::Sealed;
     if manifest.sealed_at.is_empty() {
         manifest.sealed_at = current_utc_timestamp()?;
-        fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
     }
-    Ok(manifest)
+    Ok(())
+}
+
+fn source_needs_pack_status_update(root: &Path, mode: PackMode) -> Result<bool, PackError> {
+    let manifest = read_manifest(root)?;
+    Ok(match mode {
+        PackMode::Sealed => {
+            manifest.status != ManifestStatus::Sealed || manifest.sealed_at.is_empty()
+        }
+        PackMode::Issued => {
+            manifest.status != ManifestStatus::Issued || !manifest.sealed_at.is_empty()
+        }
+    })
 }
 
 fn read_manifest(root: &Path) -> Result<Manifest, PackError> {
@@ -489,6 +623,19 @@ fn complete_manifest_defaults(value: &mut Value) -> Result<(), PackError> {
     } else {
         object.insert("created_local_time".to_string(), created_local_time);
     }
+    let sealed_at = object
+        .get("sealed_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    insert_missing_string(
+        object,
+        "status",
+        if sealed_at.is_empty() {
+            "draft"
+        } else {
+            "sealed"
+        },
+    );
     insert_missing_string(object, "sealed_at", "");
 
     let mut content = serde_json::to_value(core_content_manifest(COVER_PATH))?;
@@ -1122,10 +1269,13 @@ fn write_zip(root: &Path, output_file: &Path) -> Result<(), PackError> {
     Ok(())
 }
 
-fn sealed_filename_from_manifest(root: &Path) -> Result<String, PackError> {
+fn packed_filename_from_manifest(root: &Path, mode: PackMode) -> Result<String, PackError> {
     let bytes = fs::read(root.join(MANIFEST_PATH))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
-    sealed_filename(&manifest)
+    match mode {
+        PackMode::Sealed => sealed_filename(&manifest),
+        PackMode::Issued => issued_filename(&manifest),
+    }
 }
 
 fn sealed_filename(manifest: &Manifest) -> Result<String, PackError> {
@@ -1148,6 +1298,14 @@ fn sealed_filename(manifest: &Manifest) -> Result<String, PackError> {
 }
 
 fn draft_filename(manifest: &Manifest) -> Result<String, PackError> {
+    prefixed_id_filename(manifest, "escale")
+}
+
+fn issued_filename(manifest: &Manifest) -> Result<String, PackError> {
+    prefixed_id_filename(manifest, "escale")
+}
+
+fn prefixed_id_filename(manifest: &Manifest, prefix: &str) -> Result<String, PackError> {
     let Some(card_id) = manifest.id.strip_prefix("escale:") else {
         return Err(PackError::InvalidFilenameMetadata(
             "card id must use the canonical escale:<ULID> form".to_string(),
@@ -1161,7 +1319,7 @@ fn draft_filename(manifest: &Manifest) -> Result<String, PackError> {
     }
 
     let id10 = &card_id[card_id.len() - 10..];
-    Ok(format!("escale-{id10}.epc"))
+    Ok(format!("{prefix}-{id10}.epc"))
 }
 
 fn current_utc_timestamp() -> Result<String, PackError> {
@@ -2240,6 +2398,7 @@ mod tests {
         assert!(manifest.created_at.contains('T'));
         assert!(!manifest.created_local_time.time_zone.is_empty());
         assert!(manifest.created_local_time.utc_offset.contains(':'));
+        assert_eq!(manifest.status, ManifestStatus::Draft);
         assert_eq!(manifest.sealed_at, "");
         assert_eq!(manifest.author.display_name, "Bruno");
         assert!(draft.path().join(MESSAGE_PATH).exists());
@@ -2302,6 +2461,7 @@ mod tests {
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
         assert!(epc_core::is_valid_card_id(&manifest.id));
         assert_eq!(manifest.author.display_name, "GeeBe");
+        assert_eq!(manifest.status, ManifestStatus::Draft);
         assert_eq!(manifest.sealed_at, "");
         assert_eq!(
             fs::read_to_string(draft.path().join(MESSAGE_PATH)).unwrap(),
@@ -2333,6 +2493,7 @@ mod tests {
         let first_output =
             pack_core_format_to_directory(source.path(), first_output_dir.path()).unwrap();
         let manifest_after_first = read_manifest(source.path());
+        assert_eq!(manifest_after_first.status, ManifestStatus::Sealed);
         assert!(!manifest_after_first.sealed_at.is_empty());
 
         let second_output =
@@ -2349,6 +2510,37 @@ mod tests {
         );
         assert!(validate_epc_file(&first_output).is_valid());
         assert!(validate_epc_file(&second_output).is_valid());
+    }
+
+    #[test]
+    fn pack_issued_marks_source_without_sealing() {
+        let source = TestDir::new();
+        let output_dir = TestDir::new();
+        write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+
+        let output =
+            pack_core_format_to_directory_issued(source.path(), output_dir.path()).unwrap();
+        let manifest = read_manifest(source.path());
+
+        assert_eq!(manifest.status, ManifestStatus::Issued);
+        assert_eq!(manifest.sealed_at, "");
+        assert_eq!(
+            output.file_name().and_then(|name| name.to_str()),
+            Some("escale-9X8Q2E5M0A.epc")
+        );
+        assert!(validate_epc_file(&output).is_valid());
+    }
+
+    #[test]
+    fn pack_refuses_to_seal_issued_source() {
+        let source = TestDir::new();
+        let output_dir = TestDir::new();
+        write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        pack_core_format_to_directory_issued(source.path(), output_dir.path()).unwrap();
+
+        let error = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap_err();
+
+        assert!(matches!(error, PackError::SealedSource(_)));
     }
 
     #[test]
@@ -2382,6 +2574,7 @@ mod tests {
         assert!(is_valid_card_id(&manifest_after_pack.id));
         assert!(!manifest_after_pack.created_at.is_empty());
         assert!(!manifest_after_pack.created_local_time.time_zone.is_empty());
+        assert_eq!(manifest_after_pack.status, ManifestStatus::Sealed);
         assert!(!manifest_after_pack.sealed_at.is_empty());
         assert_eq!(
             manifest_after_pack.content,
@@ -2404,6 +2597,43 @@ mod tests {
             error,
             PackError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists
         ));
+    }
+
+    #[test]
+    fn pack_does_not_rewrite_already_sealed_source_manifest() {
+        let source = TestDir::new();
+        let output_dir = TestDir::new();
+        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let manifest_before = fs::read(source.path().join(MANIFEST_PATH)).unwrap();
+
+        let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
+        let manifest_after = fs::read(source.path().join(MANIFEST_PATH)).unwrap();
+
+        assert_eq!(manifest_before, manifest_after);
+        assert!(validate_epc_file(&output).is_valid());
+    }
+
+    #[test]
+    fn create_refuses_to_replace_sealed_manifest() {
+        let source = TestDir::new();
+        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+
+        let error = create_draft_directory(
+            CreateDraftRequest::new(source.path(), "Bruno").with_force(true),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PackError::SealedSource(_)));
+    }
+
+    #[test]
+    fn refresh_metadata_refuses_sealed_source() {
+        let source = TestDir::new();
+        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+
+        let error = refresh_manifest_image_metadata(source.path()).unwrap_err();
+
+        assert!(matches!(error, PackError::SealedSource(_)));
     }
 
     #[test]
@@ -2435,9 +2665,10 @@ mod tests {
         let source = TestDir::new();
         write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
         let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let signature_file = source.path().join(SIGNATURE_PATH);
+        fs::create_dir_all(signature_file.parent().unwrap()).unwrap();
+        fs::write(&signature_file, b"stale signature").unwrap();
 
-        let first_signature =
-            sign_core_format_directory(SignRequest::new(source.path(), &seed, "Bruno")).unwrap();
         let error = sign_core_format_directory(SignRequest::new(source.path(), &seed, "Bruno"))
             .unwrap_err();
 
@@ -2446,12 +2677,39 @@ mod tests {
             PackError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists
         ));
 
-        fs::write(&first_signature, b"stale signature").unwrap();
         sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno").with_force(true))
             .unwrap();
-        let forced_bytes = fs::read(&first_signature).unwrap();
+        let forced_bytes = fs::read(&signature_file).unwrap();
         assert_ne!(forced_bytes, b"stale signature");
         assert!(validate_core_directory(source.path()).is_valid());
+    }
+
+    #[test]
+    fn sign_refuses_sealed_source() {
+        let source = TestDir::new();
+        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+
+        let error =
+            sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno")).unwrap_err();
+
+        assert!(matches!(error, PackError::SealedSource(_)));
+        assert!(!source.path().join(SIGNATURE_PATH).exists());
+    }
+
+    #[test]
+    fn sign_refuses_issued_source() {
+        let source = TestDir::new();
+        let output_dir = TestDir::new();
+        write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        pack_core_format_to_directory_issued(source.path(), output_dir.path()).unwrap();
+        let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+
+        let error =
+            sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno")).unwrap_err();
+
+        assert!(matches!(error, PackError::SealedSource(_)));
+        assert!(!source.path().join(SIGNATURE_PATH).exists());
     }
 
     #[test]
@@ -2524,6 +2782,7 @@ mod tests {
                 time_zone: "Europe/Paris".to_string(),
                 utc_offset: "+02:00".to_string(),
             },
+            status: ManifestStatus::Sealed,
             sealed_at: "2026-06-17T10:05:00Z".to_string(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),
@@ -2546,6 +2805,7 @@ mod tests {
                 time_zone: "Europe/Paris".to_string(),
                 utc_offset: "+02:00".to_string(),
             },
+            status: ManifestStatus::Draft,
             sealed_at: String::new(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),
@@ -2568,6 +2828,7 @@ mod tests {
                 time_zone: "Europe/Paris".to_string(),
                 utc_offset: "+02:00".to_string(),
             },
+            status: ManifestStatus::Draft,
             sealed_at: String::new(),
             author: epc_core::Author {
                 display_name: "Bruno".to_string(),

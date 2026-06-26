@@ -152,9 +152,9 @@ source est utilisé.
 escale-epc pack drafts/postcard-001
 ```
 
-La commande :
+Par défaut, la commande :
 
-1. scelle le manifest si `sealed_at` est vide ;
+1. met le manifest en statut `sealed` et renseigne `sealed_at` si nécessaire ;
 2. régénère `proof/hashes.json` ;
 3. valide le dossier staging ;
 4. écrit l'archive `.epc` avec un nom canonique ;
@@ -167,6 +167,16 @@ Le nom final suit la forme :
 ```
 
 Si le fichier de sortie existe déjà, la commande refuse de l'écraser.
+
+Pour produire une carte de voyage à remettre à l'infrastructure Escale :
+
+```bash
+escale-epc pack --issued drafts/postcard-001 dist
+```
+
+Dans ce mode, le manifest passe en statut `issued`, `sealed_at` reste vide, et
+le fichier généré suit la forme `escale-<ID10>.epc`. `--issued` ne peut pas être
+combiné avec `--sign`, car la signature actuelle scelle la carte.
 
 ## Signer pendant le packing
 

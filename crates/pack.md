@@ -78,6 +78,7 @@ Le manifest reçoit automatiquement :
 - `profile = "core-format"` ;
 - `type = "postcard"` ;
 - `created_at` en UTC ;
+- `status = "draft"` ;
 - `sealed_at` vide ;
 - les chemins de contenu canoniques.
 
@@ -122,10 +123,11 @@ fn main() -> Result<(), epc_pack::PackError> {
 
 Sans `force`, la création échoue si `manifest.json` existe déjà.
 
-## Obtenir un nom de fichier de brouillon
+## Obtenir l'identifiant court d'un brouillon
 
-`draft_filename_from_directory` lit `manifest.json` et produit un nom de fichier
-non scellé de la forme `escale-<ID10>.epc`.
+`draft_filename_from_directory` lit `manifest.json` et produit le nom historique
+`escale-<ID10>.epc`. Ce format est désormais réservé aux fichiers EPC `issued` ;
+un brouillon public reste un dossier unpacked, pas une archive `.epc`.
 
 ```rust
 use epc_pack::draft_filename_from_directory;
@@ -196,9 +198,9 @@ fn main() -> Result<(), epc_pack::PackError> {
 }
 ```
 
-Cette fonction scelle le manifest si `sealed_at` est vide. Le timestamp scellé
-est écrit dans le `manifest.json` du dossier source, puis utilisé pour calculer
-le nom final.
+Cette fonction met le manifest en statut `sealed` si nécessaire. Si `sealed_at`
+est vide, le timestamp scellé est écrit dans le `manifest.json` du dossier
+source, puis utilisé pour calculer le nom final.
 
 Le nom généré suit la forme :
 
@@ -211,6 +213,12 @@ de l'identifiant EPC.
 
 Si le manifest est déjà scellé, son `sealed_at` existant est conservé. Cela
 permet de repacker le même contenu avec un nom stable.
+
+Pour préparer une carte destinée à l'infrastructure de voyage, utiliser
+`pack_core_format_to_directory_issued`. Le manifest passe alors en statut
+`issued`, `sealed_at` reste vide, et le fichier produit suit la forme
+`escale-<ID10>.epc`. Une source `issued` est verrouillée côté SDK public et ne
+doit être finalisée que par l'infrastructure de voyage.
 
 ## Signer avec un seed Ed25519
 
