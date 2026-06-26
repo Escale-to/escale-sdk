@@ -1313,11 +1313,17 @@ fn target_dimensions(
         return Ok((width, height));
     }
 
-    let width_ratio = u64::from(max_width) * 1_000_000 / u64::from(width);
-    let height_ratio = u64::from(max_height) * 1_000_000 / u64::from(height);
-    let ratio = width_ratio.min(height_ratio).max(1);
-    let target_width = ((u64::from(width) * ratio) / 1_000_000).max(1) as u32;
-    let target_height = ((u64::from(height) * ratio) / 1_000_000).max(1) as u32;
+    let width_limited =
+        u64::from(max_width) * u64::from(height) <= u64::from(max_height) * u64::from(width);
+    let (target_width, target_height) = if width_limited {
+        let target_height =
+            (u64::from(height) * u64::from(max_width) / u64::from(width)).max(1) as u32;
+        (max_width, target_height)
+    } else {
+        let target_width =
+            (u64::from(width) * u64::from(max_height) / u64::from(height)).max(1) as u32;
+        (target_width, max_height)
+    };
     Ok((target_width, target_height))
 }
 
@@ -1998,6 +2004,13 @@ mod tests {
         assert_eq!(resized.width, 2);
         assert_eq!(resized.height, 1);
         assert_eq!(resized.pixels.len(), resized.expected_len());
+    }
+
+    #[test]
+    fn target_dimensions_keeps_exact_limiting_side() {
+        let dimensions = target_dimensions(1440, 720, RenderOptions::fit(256, 256)).unwrap();
+
+        assert_eq!(dimensions, (256, 128));
     }
 
     #[test]
