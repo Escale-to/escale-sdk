@@ -349,6 +349,26 @@ let json = serde_json::to_string_pretty(&manifest)?;
 
 Dans le JSON, le champ Rust `object_type` est sérialisé sous le nom `type`.
 
+## Statut du manifest
+
+`ManifestStatus` modélise le cycle de vie public d'une carte :
+
+- `Draft` : dossier unpacked encore modifiable par une application, la CLI ou
+  le SDK public ;
+- `Issued` : archive `.epc` remise à l'infrastructure de voyage Escale ;
+- `Sealed` : archive `.epc` finale et immutable.
+
+La relation avec `sealed_at` est volontairement stricte :
+
+- `Draft` et `Issued` gardent `sealed_at` vide ;
+- `Sealed` doit renseigner `sealed_at`.
+
+Les noms de fichiers suivent la même séparation :
+
+- `draft` : dossier, par exemple `escale-<TIME6>-<RAND2>/` ;
+- `issued` : archive `escale-<ID10>.epc` ;
+- `sealed` : archive `<TIME6>-<ID10>.epc`.
+
 ## Construire un fichier `proof/hashes.json`
 
 `Hashes` représente le descripteur d'intégrité EPC.

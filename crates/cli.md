@@ -178,6 +178,10 @@ Dans ce mode, le manifest passe en statut `issued`, `sealed_at` reste vide, et
 le fichier généré suit la forme `escale-<ID10>.epc`. `--issued` ne peut pas être
 combiné avec `--sign`, car la signature actuelle scelle la carte.
 
+`pack` attend toujours un dossier EPC unpacked comme source. Une archive `.epc`
+déjà produite, qu'elle soit `issued` ou `sealed`, doit être validée avec
+`validate`, pas repackée par la CLI publique.
+
 ## Signer pendant le packing
 
 `pack` peut signer avec une clé privée OpenSSH Ed25519 non chiffrée avant
@@ -195,6 +199,9 @@ escale-epc pack --sign keys/author_ed25519 --force drafts/postcard-001 dist
 ```
 
 `--force` n'est accepté avec `pack` que si `--sign` est aussi présent.
+
+Ce flux produit une carte `sealed`. Il ne s'applique pas à une carte `issued`,
+dont la finalisation appartient à l'infrastructure de voyage Escale.
 
 ## Signer un dossier unpacked
 

@@ -122,8 +122,24 @@ packing.
 No need to create `proof/hashes.json` because `pack` generates it
 automatically before writing the `.epc` file.
 
-`create` initializes an unpacked draft tree. Drafts are directories, not `.epc`
-files. The reference CLI uses draft directory names such as:
+### Lifecycle and filenames
+
+EPC lifecycle is explicit in `manifest.json` through the `status` field:
+
+| Status | Shape | Filename | Writer |
+| --- | --- | --- | --- |
+| `draft` | unpacked directory | `escale-<TIME6>-<RAND2>/` | authoring app, CLI, or SDK |
+| `issued` | `.epc` archive | `escale-<ID10>.epc` | public SDK handoff to Escale travel infrastructure |
+| `sealed` | `.epc` archive | `<TIME6>-<ID10>.epc` | public SDK for non-travel cards, or Escale travel infrastructure after delivery |
+
+`draft` is the only public-SDK writable authoring state. `issued` and `sealed`
+sources are locked by the public SDK: create/reset, media metadata refresh, and
+signature writes are refused. Issued cards are intended for the Escale travel
+infrastructure, which may add travel data and later produce the final sealed
+archive.
+
+The public SDK intentionally does not define a draft `.epc` filename. A draft is
+an unpacked directory. The reference CLI uses draft directory names such as:
 
 ```text
 escale-<TIME6>-<RAND2>/
@@ -161,7 +177,8 @@ produce the same ADR-003 filename. `pack` refuses to overwrite an existing
 For cards handed to the Escale travel infrastructure, use `pack --issued`.
 Issued cards use `"status": "issued"`, keep `sealed_at` empty, and are written
 with an `escale-<ID10>.epc` filename. They are locked for the public SDK; final
-sealing is left to the travel infrastructure.
+sealing is left to the travel infrastructure. `pack --issued` cannot be combined
+with `pack --sign`, because the current public signature flow seals the card.
 
 Authenticity is added with `sign`, which writes `proof/signature.json`:
 
@@ -188,9 +205,10 @@ when no signature proof is present. This lets repeated packing remain stable.
 
 `sign` seals the draft when needed, regenerates `proof/hashes.json`, signs the
 canonical EPC signature payload with the OpenSSH Ed25519 private key, and records
-the public key, key id, policy, and signature value. The signature binds to
-`proof/hashes.json.core_digest`; it does not change the immutable core digest.
-Encrypted OpenSSH private keys are not supported yet.
+the public key, key id, policy, and signature value. It refuses `issued` and
+already sealed sources. The signature binds to `proof/hashes.json.core_digest`;
+it does not change the immutable core digest. Encrypted OpenSSH private keys are
+not supported yet.
 
 If `manifest.json` already exists, `create` refuses to overwrite it. Use
 `create --force` to reset the draft manifest; this regenerates `id` and

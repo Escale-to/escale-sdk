@@ -44,6 +44,26 @@ et n'agrandit pas l'image.
 `epc-pack` régénère `proof/hashes.json` lors de la signature et du packing.
 Il ne faut donc pas écrire ce fichier à la main dans une application cliente.
 
+## Cycle de vie et noms de fichiers
+
+Le manifest porte un champ `status` qui décrit l'état d'écriture de la carte :
+
+| Statut | Forme | Nom | Responsable de l'écriture |
+| --- | --- | --- | --- |
+| `draft` | dossier unpacked | `escale-<TIME6>-<RAND2>/` | app, CLI ou SDK public |
+| `issued` | archive `.epc` | `escale-<ID10>.epc` | SDK public, pour remise à l'infrastructure de voyage |
+| `sealed` | archive `.epc` | `<TIME6>-<ID10>.epc` | SDK public pour une carte qui ne voyage pas, ou infrastructure de voyage après délivrance |
+
+Un brouillon n'est pas une archive `.epc` publique : c'est un dossier unpacked.
+Le format `escale-<ID10>.epc` est réservé à une archive `issued`.
+
+Une source `issued` ou `sealed` est verrouillée par le SDK public. Les fonctions
+qui écrivent dans le dossier source, comme `create_draft_directory`,
+`refresh_manifest_image_metadata` ou `sign_core_format_directory`, retournent
+`PackError::SealedSource`. Le même verrou empêche le SDK public de transformer
+une source `issued` en `sealed` : cette finalisation appartient à
+l'infrastructure de voyage.
+
 ## Créer un dossier de brouillon
 
 `CreateDraftRequest` décrit la création d'un dossier EPC unpacked.
@@ -139,8 +159,9 @@ fn main() -> Result<(), epc_pack::PackError> {
 }
 ```
 
-Ce nom est utile pour afficher un brouillon dans une interface, avant sealing.
-Le nom final d'un EPC scellé est produit par `pack_core_format_to_directory`.
+Ce helper reste disponible pour compatibilité, mais une nouvelle interface ne
+devrait pas l'utiliser pour nommer une archive de brouillon. Le nom final d'un
+EPC scellé est produit par `pack_core_format_to_directory`.
 
 ## Packer vers un chemin explicite
 
@@ -162,8 +183,8 @@ fn main() -> Result<(), epc_pack::PackError> {
 ```
 
 `pack_core_format` copie le dossier source dans un staging temporaire,
-régénère `proof/hashes.json`, valide le staging avec `epc-validate`, puis écrit
-le ZIP final.
+prépare le statut demandé par `PackRequest::mode`, régénère `proof/hashes.json`,
+valide le staging avec `epc-validate`, puis écrit le ZIP final.
 
 Le dossier source doit contenir au minimum :
 
@@ -178,6 +199,9 @@ l'archive.
 
 Attention : cette fonction écrit le fichier de sortie avec `create_new`. Elle
 échoue si le fichier `.epc` existe déjà.
+
+`PackRequest::new` choisit `PackMode::Sealed` par défaut. Pour produire une
+archive de remise au voyage, utiliser `with_mode(PackMode::Issued)`.
 
 ## Packer dans un dossier de sortie
 
@@ -248,7 +272,8 @@ UTF8("EPC-SIGNATURE-V1\n") || JCS(payload)
 ```
 
 Avant d'écrire la signature, le dossier est scellé si nécessaire,
-`proof/hashes.json` est régénéré, puis le dossier est validé.
+`proof/hashes.json` est régénéré, puis le dossier est validé. La signature
+refuse les sources `issued` et `sealed`.
 
 Par défaut, le rôle du signataire est `author`. Pour le changer :
 
@@ -401,6 +426,8 @@ Les cas importants sont :
   canonique ;
 - `InvalidSignatureMetadata` : la demande de signature, le seed ou la clé sont
   invalides ;
+- `SealedSource` : l'opération écrirait dans une source déjà `issued` ou
+  `sealed` ;
 - `Io` : erreur filesystem ou processus ;
 - `Json` : erreur de sérialisation ou désérialisation JSON ;
 - `Zip` : erreur d'écriture ZIP.
@@ -420,6 +447,10 @@ Pour packer vers un fichier précis, utiliser `pack_core_format` avec
 
 Pour packer vers un dossier avec nom canonique scellé, utiliser
 `pack_core_format_to_directory`.
+
+Pour produire une archive `issued` destinée à l'infrastructure de voyage,
+utiliser `pack_core_format_to_directory_issued` ou `PackRequest::with_mode` avec
+`PackMode::Issued`.
 
 Pour signer avec un seed Base64URL, utiliser `sign_core_format_directory`.
 

@@ -203,7 +203,7 @@ pub enum PackError {
     /// The staged capsule failed validation before ZIP assembly.
     InvalidSource(ValidationReport),
 
-    /// The operation would modify an already sealed EPC source directory.
+    /// The operation would modify an already issued or sealed EPC source directory.
     SealedSource(String),
 
     /// The manifest cannot produce an ADR-003 sealed capsule filename.
@@ -333,6 +333,8 @@ pub fn refresh_manifest_image_metadata(root: impl AsRef<Path>) -> Result<(), Pac
 ///
 /// The source is sealed when needed, `proof/hashes.json` is regenerated, and the
 /// Ed25519 signature covers `UTF8("EPC-SIGNATURE-V1\n") || JCS(payload)`.
+/// Issued sources are refused because finalization belongs to the Escale travel
+/// infrastructure.
 pub fn sign_core_format_directory(request: SignRequest) -> Result<PathBuf, PackError> {
     let source_dir = request.source_dir.clone();
     ensure_manifest_is_not_sealed(&source_dir, "sign capsule")?;
@@ -408,11 +410,12 @@ pub fn pack_core_format(request: PackRequest) -> Result<(), PackError> {
 
 /// Packs a source directory into `output_dir` using the ADR-003 sealed filename.
 ///
-/// This writes `manifest.json` `sealed_at` to the current UTC time when the
-/// source is still an unsealed draft. Already sealed sources keep their existing
-/// timestamp, so repeated packs use a stable filename. The generated filename
-/// has the form `<TIME6>-<ID10>.epc`, derived from the sealed manifest. The
-/// final path is returned on success.
+/// This writes `manifest.json` `status = "sealed"` and sets `sealed_at` to the
+/// current UTC time when the source is still an unsealed draft. Already sealed
+/// sources keep their existing timestamp, so repeated packs use a stable
+/// filename. Issued sources are refused by the public SDK. The generated
+/// filename has the form `<TIME6>-<ID10>.epc`, derived from the sealed manifest.
+/// The final path is returned on success.
 pub fn pack_core_format_to_directory(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
@@ -429,7 +432,8 @@ pub fn pack_core_format_to_directory(
 ///
 /// The source must still be a draft. The packed archive and source manifest are
 /// moved to `issued` without setting `sealed_at`; final sealing remains the
-/// responsibility of the Escale travel infrastructure.
+/// responsibility of the Escale travel infrastructure. The generated filename
+/// has the form `escale-<ID10>.epc`.
 pub fn pack_core_format_to_directory_issued(
     source_dir: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,

@@ -387,6 +387,8 @@ Le validateur lit `manifest.json` et vérifie notamment :
 - `profile = "core-format"` ;
 - `type = "postcard"` ;
 - `id` au format `escale:<ULID>` ;
+- `status` parmi `draft`, `issued` ou `sealed` ;
+- la cohérence entre `status` et `sealed_at` ;
 - `created_local_time.time_zone` non vide et sûr ;
 - `created_local_time.utc_offset` au format `+HH:MM` ou `-HH:MM` ;
 - `author.display_name` non vide ;
@@ -395,6 +397,14 @@ Le validateur lit `manifest.json` et vérifie notamment :
 
 Les erreurs de manifest incluent généralement un `pointer` JSON pour aider une
 interface ou une CLI à localiser le champ concerné.
+
+Pour le cycle de vie :
+
+- `draft` et `issued` doivent garder `sealed_at` vide ;
+- `sealed` doit renseigner `sealed_at` ;
+- les anciens manifests sans champ `status` restent lisibles : le validateur
+  les interprète comme `sealed` si `sealed_at` est renseigné, sinon comme
+  `draft`.
 
 ## Validation Markdown
 
