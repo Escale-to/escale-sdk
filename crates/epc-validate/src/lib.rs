@@ -23,9 +23,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use epc_core::{
     cover_mime_for_path, expected_file_size_limit, is_allowed_regular_file,
     is_expected_hashed_core_file, is_safe_core_path, is_supported_cover_path, is_valid_card_id,
-    HashEntry, HashTransform, Hashes, Manifest, ManifestStatus, SignatureProof,
-    CORE_DOMAIN_SEPARATOR, CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0,
-    HASHES_PATH, HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
+    HashEntry, HashTransform, Hashes, Manifest, SignatureProof, CORE_DOMAIN_SEPARATOR,
+    CORE_PROFILE, COVER_PATH, EPC_OBJECT_TYPE_POSTCARD, EPC_VERSION_1_0, HASHES_PATH,
+    HASH_ALGORITHM_SHA256, INTEGRITY_VERSION_1, MANIFEST_PATH, MARKDOWN_CORE_PROFILE,
     MARKDOWN_CORE_PROFILE_VERSION, MAX_ARCHIVE_SIZE, MAX_MARKDOWN_LINE_BYTES, MAX_MARKDOWN_LINKS,
     MAX_REGULAR_FILES, MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_ZIP_ENTRIES, MESSAGE_PATH,
     SIGNATURE_DOMAIN_SEPARATOR, SIGNATURE_PATH, THUMBNAIL_PATH,
@@ -38,6 +38,8 @@ use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive};
 
 const MAX_COMPRESSION_RATIO: u64 = 100;
+
+pub use epc_core::ManifestStatus;
 
 /// Severity of a validation issue.
 ///
@@ -210,6 +212,14 @@ pub struct SignatureProofReport {
     pub verified_signatures: Vec<VerifiedSignatureReport>,
 }
 
+/// Manifest metadata collected during validation.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestReport {
+    /// Lifecycle status declared by `manifest.json`, when it could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<ManifestStatus>,
+}
+
 /// One successfully verified signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedSignatureReport {
@@ -241,8 +251,25 @@ pub struct ValidationReport {
     /// Positive proof-check results.
     pub proofs: ProofReport,
 
+    /// Manifest metadata collected during validation.
+    pub manifest: ManifestReport,
+
     /// Ordered list of validation issues.
+    ///
+    /// The issue order is the validator discovery order, not a presentation
+    /// order. Use [`ValidationReport::sorted_issues`] for stable UI output.
     pub issues: Vec<ValidationIssue>,
+}
+
+/// Amount of informational validation output to include.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationVerbosity {
+    /// Emit only actionable validation issues.
+    #[default]
+    Normal,
+
+    /// Emit additional informational issues for viewers and diagnostics.
+    Verbose,
 }
 
 /// Options controlling expensive validation passes.
@@ -251,12 +278,16 @@ pub struct ValidationOptions {
     /// Whether JPEG XL content should be decoded and checked against EPC image
     /// limits.
     pub validate_jxl_images: bool,
+
+    /// Amount of informational validation output to include.
+    pub verbosity: ValidationVerbosity,
 }
 
 impl Default for ValidationOptions {
     fn default() -> Self {
         Self {
             validate_jxl_images: true,
+            verbosity: ValidationVerbosity::Normal,
         }
     }
 }
@@ -269,6 +300,18 @@ impl ValidationOptions {
     /// signature consistency.
     pub fn without_jxl_images(mut self) -> Self {
         self.validate_jxl_images = false;
+        self
+    }
+
+    /// Returns options that emit informational validation issues.
+    pub fn verbose(mut self) -> Self {
+        self.verbosity = ValidationVerbosity::Verbose;
+        self
+    }
+
+    /// Returns options with an explicit verbosity level.
+    pub fn with_verbosity(mut self, verbosity: ValidationVerbosity) -> Self {
+        self.verbosity = verbosity;
         self
     }
 }
@@ -288,6 +331,7 @@ impl ValidationReport {
             epc_version: epc_version.into(),
             summary: ValidationSummary::default(),
             proofs: ProofReport::default(),
+            manifest: ManifestReport::default(),
             issues: Vec::new(),
         }
     }
@@ -314,6 +358,7 @@ impl ValidationReport {
         self.profile = other.profile;
         self.epc_version = other.epc_version;
         self.proofs = other.proofs;
+        self.manifest = other.manifest;
         for issue in other.issues {
             self.push(issue);
         }
@@ -322,6 +367,44 @@ impl ValidationReport {
     /// Returns `true` when at least one fatal issue has been recorded.
     pub fn has_fatal(&self) -> bool {
         self.summary.fatal > 0
+    }
+
+    /// Returns issues sorted for stable presentation.
+    ///
+    /// The sort order is `fatal`, `error`, `warning`, `info`, then file,
+    /// pointer, code, title, related file, and detail.
+    pub fn sorted_issues(&self) -> Vec<&ValidationIssue> {
+        let mut issues = self.issues.iter().collect::<Vec<_>>();
+        issues.sort_by(|left, right| {
+            (
+                severity_presentation_rank(left.severity),
+                left.file.as_deref(),
+                left.pointer.as_deref(),
+                left.code.as_str(),
+                left.title.as_str(),
+                left.related_file.as_deref(),
+                left.detail.as_str(),
+            )
+                .cmp(&(
+                    severity_presentation_rank(right.severity),
+                    right.file.as_deref(),
+                    right.pointer.as_deref(),
+                    right.code.as_str(),
+                    right.title.as_str(),
+                    right.related_file.as_deref(),
+                    right.detail.as_str(),
+                ))
+        });
+        issues
+    }
+}
+
+fn severity_presentation_rank(severity: IssueSeverity) -> u8 {
+    match severity {
+        IssueSeverity::Fatal => 0,
+        IssueSeverity::Error => 1,
+        IssueSeverity::Warning => 2,
+        IssueSeverity::Info => 3,
     }
 }
 
@@ -362,9 +445,6 @@ impl CoreDirectoryValidator {
 
     /// Validates the directory with explicit validation options.
     pub fn validate_with_options(&self, options: ValidationOptions) -> ValidationReport {
-        #[cfg(not(feature = "jxl"))]
-        let _ = options;
-
         let mut report = ValidationReport::default();
         let mut files = BTreeSet::new();
         let mut total_size = 0_u64;
@@ -500,6 +580,8 @@ impl CoreDirectoryValidator {
         if let Some(manifest) = &manifest {
             report.epc_version = manifest.epc_version.clone();
             report.profile = manifest.profile.clone();
+            report.manifest.status = Some(manifest.status);
+            push_manifest_info(manifest, options, &mut report);
             validate_manifest(manifest, &mut report);
             if !observed_files.contains(&manifest.content.cover.path) {
                 report.push(
@@ -565,6 +647,14 @@ pub fn validate_core_directory_with_options(
 /// directory, then delegates manifest and integrity checks to
 /// [`validate_core_directory`].
 pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
+    validate_epc_file_with_options(path, ValidationOptions::default())
+}
+
+/// Validates a `.epc` ZIP archive with explicit validation options.
+pub fn validate_epc_file_with_options(
+    path: impl AsRef<Path>,
+    options: ValidationOptions,
+) -> ValidationReport {
     let path = path.as_ref();
     let mut report = ValidationReport::default();
 
@@ -847,7 +937,8 @@ pub fn validate_epc_file(path: impl AsRef<Path>) -> ValidationReport {
     }
 
     let content_report =
-        CoreDirectoryValidator::with_observed_files(temp_dir.path(), observed_files).validate();
+        CoreDirectoryValidator::with_observed_files(temp_dir.path(), observed_files)
+            .validate_with_options(options);
     report.extend(content_report);
     report
 }
@@ -1154,6 +1245,36 @@ fn read_signature(root: &Path, report: &mut ValidationReport) -> Option<Signatur
             );
             None
         }
+    }
+}
+
+fn push_manifest_info(
+    manifest: &Manifest,
+    options: ValidationOptions,
+    report: &mut ValidationReport,
+) {
+    if options.verbosity != ValidationVerbosity::Verbose {
+        return;
+    }
+
+    let status = manifest_status_as_str(manifest.status);
+    report.push(
+        ValidationIssue::new(
+            IssueSeverity::Info,
+            "EPC_MANIFEST_STATUS",
+            "Manifest status",
+            format!("manifest.json declares status {status}."),
+        )
+        .with_file(MANIFEST_PATH)
+        .with_pointer("#/status"),
+    );
+}
+
+fn manifest_status_as_str(status: ManifestStatus) -> &'static str {
+    match status {
+        ManifestStatus::Draft => "draft",
+        ManifestStatus::Issued => "issued",
+        ManifestStatus::Sealed => "sealed",
     }
 }
 
@@ -2087,6 +2208,81 @@ mod tests {
         let report = validate_core_directory(root.path());
 
         assert!(report.is_valid(), "{report:#?}");
+        assert_eq!(report.manifest.status, Some(ManifestStatus::Sealed));
+        assert_eq!(report.summary.info, 0);
+    }
+
+    #[test]
+    fn emits_manifest_status_info_in_verbose_mode() {
+        let root = TestDir::new();
+        write_minimal_capsule(root.path(), "escale:00000000000000000000000000");
+
+        let report = validate_core_directory_with_options(
+            root.path(),
+            ValidationOptions::default().verbose(),
+        );
+
+        assert!(report.is_valid(), "{report:#?}");
+        assert_eq!(report.manifest.status, Some(ManifestStatus::Sealed));
+        assert_eq!(report.summary.info, 1);
+        assert!(report.issues.iter().any(|issue| {
+            issue.severity == IssueSeverity::Info
+                && issue.code == "EPC_MANIFEST_STATUS"
+                && issue.file.as_deref() == Some(MANIFEST_PATH)
+                && issue.pointer.as_deref() == Some("#/status")
+        }));
+    }
+
+    #[test]
+    fn sorts_issues_for_stable_presentation() {
+        let mut report = ValidationReport::default();
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Info,
+                "APP_INFO",
+                "Application info",
+                "Application info.",
+            )
+            .with_file("z.txt"),
+        );
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Warning,
+                "APP_WARNING",
+                "Application warning",
+                "Application warning.",
+            )
+            .with_file("b.txt"),
+        );
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Fatal,
+                "APP_FATAL",
+                "Application fatal",
+                "Application fatal.",
+            )
+            .with_file("c.txt"),
+        );
+        report.push(
+            ValidationIssue::new(
+                IssueSeverity::Error,
+                "APP_ERROR",
+                "Application error",
+                "Application error.",
+            )
+            .with_file("a.txt"),
+        );
+
+        let sorted_codes = report
+            .sorted_issues()
+            .into_iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sorted_codes,
+            ["APP_FATAL", "APP_ERROR", "APP_WARNING", "APP_INFO"]
+        );
     }
 
     #[test]
@@ -2189,6 +2385,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jxl")]
     fn rejects_invalid_jxl_content() {
         let root = TestDir::new();
         write_minimal_capsule(root.path(), "escale:00000000000000000000000000");

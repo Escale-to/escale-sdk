@@ -114,6 +114,7 @@ let report = validate_epc_file("dist/postcard.epc");
 println!("valid: {}", report.valid);
 println!("profile: {}", report.profile);
 println!("epc version: {}", report.epc_version);
+println!("manifest status: {:?}", report.manifest.status);
 println!("errors: {}", report.summary.error);
 println!("warnings: {}", report.summary.warning);
 ```
@@ -125,12 +126,14 @@ Les champs principaux sont :
 - `epc_version` : version EPC détectée ou attendue ;
 - `summary` : nombre d'issues par sévérité ;
 - `proofs` : état des preuves d'intégrité et de signature ;
+- `manifest` : métadonnées du manifest récupérées pendant la validation ;
 - `issues` : liste détaillée des problèmes.
 
 Les types publics qui composent ce rapport sont :
 
 - `ValidationSummary`, pour les compteurs par sévérité ;
 - `ProofReport`, pour regrouper les preuves positives ;
+- `ManifestReport`, pour les métadonnées du manifest comme `status` ;
 - `IntegrityProofReport`, pour l'état de `proof/hashes.json` ;
 - `SignatureProofReport`, pour l'état de `proof/signature.json` ;
 - `VerifiedSignatureReport`, pour chaque signature vérifiée avec succès.
@@ -151,6 +154,19 @@ if report.has_fatal() {
     println!("validation interrompue ou partiellement impossible");
 }
 ```
+
+`issues` conserve l'ordre de découverte du validateur. Cet ordre suit les passes
+internes de validation et ne doit pas être utilisé comme ordre d'affichage
+stable. Pour une interface utilisateur, utiliser `sorted_issues()`.
+
+```rust
+for issue in report.sorted_issues() {
+    println!("[{:?}] {}", issue.severity, issue.code);
+}
+```
+
+L'ordre de présentation est : `fatal`, `error`, `warning`, `info`, puis fichier,
+JSON Pointer, code, titre, fichier lié et détail.
 
 ## Comprendre les sévérités
 
@@ -174,6 +190,22 @@ Les règles de validité sont simples :
 - `error` rend le rapport invalide ;
 - `fatal` rend le rapport invalide et signale souvent un risque de sécurité ou
   une impossibilité de poursuivre correctement.
+
+Par défaut, le validateur n'émet que les issues actionnables. Les issues
+`info` sont réservées au mode verbose.
+
+```rust
+use epc_validate::{validate_core_directory_with_options, ValidationOptions};
+
+let report = validate_core_directory_with_options(
+    "drafts/postcard-001",
+    ValidationOptions::default().verbose(),
+);
+```
+
+En mode verbose, le validateur émet notamment `EPC_MANIFEST_STATUS`, qui expose
+le statut lu dans `manifest.json`. Pour récupérer cette valeur dans un viewer,
+préférer `report.manifest.status` à une recherche dans `issues`.
 
 ## Lire une issue
 
