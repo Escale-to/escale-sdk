@@ -1100,7 +1100,7 @@ mod tests {
         let path = std::env::temp_dir().join("epc-cli-jpeg-named-png.png");
         std::fs::write(
             &path,
-            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jpeg"),
+            include_bytes!("../../../../resource/images/arc-de-triomphe-paris.jpeg"),
         )
         .unwrap();
 

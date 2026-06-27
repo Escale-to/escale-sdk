@@ -279,6 +279,9 @@ pub struct ValidationOptions {
     /// limits.
     pub validate_jxl_images: bool,
 
+    /// Whether sealed manifests must include `proof/signature.json`.
+    pub require_sealed_signature: bool,
+
     /// Amount of informational validation output to include.
     pub verbosity: ValidationVerbosity,
 }
@@ -287,6 +290,7 @@ impl Default for ValidationOptions {
     fn default() -> Self {
         Self {
             validate_jxl_images: true,
+            require_sealed_signature: true,
             verbosity: ValidationVerbosity::Normal,
         }
     }
@@ -300,6 +304,15 @@ impl ValidationOptions {
     /// signature consistency.
     pub fn without_jxl_images(mut self) -> Self {
         self.validate_jxl_images = false;
+        self
+    }
+
+    /// Returns options that allow sealed manifests without a signature proof.
+    ///
+    /// This is intended only for internal signing flows that validate the
+    /// sealed core immediately before writing `proof/signature.json`.
+    pub fn without_sealed_signature(mut self) -> Self {
+        self.require_sealed_signature = false;
         self
     }
 
@@ -617,6 +630,18 @@ impl CoreDirectoryValidator {
                 if let Some(signature) = read_signature(&self.root, &mut report) {
                     report.proofs.signature.present = true;
                     validate_signature(manifest, hashes, &signature, &mut report);
+                } else if options.require_sealed_signature
+                    && manifest.status == ManifestStatus::Sealed
+                {
+                    report.push(
+                        ValidationIssue::new(
+                            IssueSeverity::Error,
+                            "EPC_SIGNATURE_REQUIRED_FOR_SEALED",
+                            "Signature proof required for sealed capsule",
+                            "sealed manifests must include proof/signature.json.",
+                        )
+                        .with_file(SIGNATURE_PATH),
+                    );
                 }
             }
         }
@@ -2196,6 +2221,7 @@ fn canonical_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2210,6 +2236,21 @@ mod tests {
         assert!(report.is_valid(), "{report:#?}");
         assert_eq!(report.manifest.status, Some(ManifestStatus::Sealed));
         assert_eq!(report.summary.info, 0);
+    }
+
+    #[test]
+    fn rejects_sealed_manifest_without_signature_proof() {
+        let root = TestDir::new();
+        write_minimal_capsule(root.path(), "escale:00000000000000000000000000");
+        fs::remove_file(root.path().join(SIGNATURE_PATH)).unwrap();
+
+        let report = validate_core_directory(root.path());
+
+        assert!(!report.is_valid());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == "EPC_SIGNATURE_REQUIRED_FOR_SEALED"
+                && issue.file.as_deref() == Some(SIGNATURE_PATH)
+        }));
     }
 
     #[test]
@@ -2292,7 +2333,7 @@ mod tests {
             root.path(),
             "escale:00000000000000000000000000",
             "media/cover.jpg",
-            include_bytes!("../../../testcases/images/tour-eiffel.jpg"),
+            include_bytes!("../../../../resource/images/tour-eiffel.jpg"),
         );
 
         let report = validate_core_directory(root.path());
@@ -2428,7 +2469,7 @@ mod tests {
             root,
             card_id,
             COVER_PATH,
-            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
+            include_bytes!("../../../../resource/images/arc-de-triomphe-paris.jxl"),
         );
     }
 
@@ -2516,12 +2557,64 @@ mod tests {
             serde_json::to_string_pretty(&hashes).unwrap(),
         )
         .unwrap();
+        write_signature_proof(root, card_id, &hashes);
+    }
+
+    fn write_signature_proof(root: &Path, card_id: &str, hashes: &Hashes) {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key_x = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+        let key_id = ed25519_jwk_thumbprint(&public_key_x);
+        let payload = epc_core::SignaturePayload {
+            context: "EPC-SIGNATURE-V1".to_string(),
+            card_id: card_id.to_string(),
+            epc_version: EPC_VERSION_1_0.to_string(),
+            core_digest: hashes.core_digest.clone(),
+            hash_algorithm: hashes.hash_algorithm.clone(),
+            signed_at: "2026-06-17T10:06:00Z".to_string(),
+            signer: epc_core::SignatureSigner {
+                display_name: "Bruno".to_string(),
+                role: "author".to_string(),
+            },
+            policy: epc_core::SignaturePolicy {
+                mode: "all".to_string(),
+                required_keys: vec![epc_core::SignatureRequiredKey {
+                    algorithm: "Ed25519".to_string(),
+                    key_id: key_id.clone(),
+                }],
+            },
+        };
+
+        let mut input = Vec::new();
+        input.extend_from_slice(SIGNATURE_DOMAIN_SEPARATOR.as_bytes());
+        input
+            .extend_from_slice(canonical_json(&serde_json::to_value(&payload).unwrap()).as_bytes());
+        let signature = signing_key.sign(&input);
+        let proof = SignatureProof {
+            signature_version: "1".to_string(),
+            payload,
+            signatures: vec![epc_core::SignatureEntry {
+                algorithm: "Ed25519".to_string(),
+                key_id,
+                public_key: epc_core::SignaturePublicKey {
+                    kty: "OKP".to_string(),
+                    crv: "Ed25519".to_string(),
+                    x: public_key_x,
+                },
+                value: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            }],
+        };
+
+        fs::write(
+            root.join(SIGNATURE_PATH),
+            serde_json::to_string_pretty(&proof).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_sample_thumbnail_jxl(root: &Path) {
         fs::write(
             root.join(THUMBNAIL_PATH),
-            include_bytes!("../../../testcases/images/thumbnail-256.jxl"),
+            include_bytes!("../../../../resource/images/thumbnail-256.jxl"),
         )
         .unwrap();
     }
@@ -2544,13 +2637,18 @@ mod tests {
         }
 
         let manifest = read_manifest(root, &mut ValidationReport::default()).unwrap();
-        for path in [
+        let mut paths = vec![
             MANIFEST_PATH,
             manifest.content.cover.path.as_str(),
             THUMBNAIL_PATH,
             MESSAGE_PATH,
             HASHES_PATH,
-        ] {
+        ];
+        if root.join(SIGNATURE_PATH).exists() {
+            paths.push(SIGNATURE_PATH);
+        }
+
+        for path in paths {
             zip.start_file(path, file_options).unwrap();
             let bytes = fs::read(root.join(path)).unwrap();
             zip.write_all(&bytes).unwrap();

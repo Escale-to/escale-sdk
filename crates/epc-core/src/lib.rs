@@ -64,7 +64,7 @@ pub const MESSAGE_PATH: &str = "text/message.md";
 /// Required integrity proof path.
 pub const HASHES_PATH: &str = "proof/hashes.json";
 
-/// Optional authenticity proof path.
+/// Authenticity proof path, required for sealed manifests by SDK policy.
 pub const SIGNATURE_PATH: &str = "proof/signature.json";
 
 /// All regular files required by a `core-format` capsule.

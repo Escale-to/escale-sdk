@@ -1926,7 +1926,7 @@ mod tests {
     fn renders_cover_rgba8_with_resize() {
         let image = decode_jxl_file_rgba8(
             format!(
-                "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
+                "{}/../../../resource/images/arc-de-triomphe-paris.jxl",
                 env!("CARGO_MANIFEST_DIR")
             ),
             EpcImageKind::Cover,
@@ -1942,7 +1942,7 @@ mod tests {
     #[test]
     fn reads_supported_image_metadata() {
         let jpeg = read_image_metadata_file(format!(
-            "{}/../../testcases/images/arc-de-triomphe-paris.jpeg",
+            "{}/../../../resource/images/arc-de-triomphe-paris.jpeg",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
@@ -1953,7 +1953,7 @@ mod tests {
         assert_eq!(jpeg.bits_per_pixel, 24);
 
         let jxl = read_image_metadata_file(format!(
-            "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
+            "{}/../../../resource/images/arc-de-triomphe-paris.jxl",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
@@ -1978,7 +1978,10 @@ mod tests {
     #[test]
     fn renders_thumbnail_from_directory() {
         let image = render_thumbnail_from_directory_rgba8(
-            format!("{}/../../testcases/pc_0", env!("CARGO_MANIFEST_DIR")),
+            format!(
+                "{}/../../../resource/images/escale-0018IZ-50",
+                env!("CARGO_MANIFEST_DIR")
+            ),
             RenderOptions::fit(128, 128),
         )
         .unwrap();
@@ -2016,7 +2019,7 @@ mod tests {
     #[test]
     fn derives_thumbnail_from_cover_file() {
         let image = derive_thumbnail_rgba8_from_cover_jxl_file(format!(
-            "{}/../../testcases/images/arc-de-triomphe-paris.jxl",
+            "{}/../../../resource/images/arc-de-triomphe-paris.jxl",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
@@ -2039,7 +2042,7 @@ mod tests {
         zip.add_directory("media/", options).unwrap();
         zip.start_file(COVER_PATH, options).unwrap();
         zip.write_all(include_bytes!(
-            "../../../testcases/images/arc-de-triomphe-paris.jxl"
+            "../../../../resource/images/arc-de-triomphe-paris.jxl"
         ))
         .unwrap();
         zip.finish().unwrap();
@@ -2076,7 +2079,7 @@ mod tests {
     #[test]
     fn encodes_thumbnail_from_cover_bytes_with_libjxl_encoder() {
         let bytes = encode_thumbnail_from_cover_jxl_bytes(
-            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
+            include_bytes!("../../../../resource/images/arc-de-triomphe-paris.jxl"),
             &EncodeOptions::default(),
         )
         .unwrap();
@@ -2096,7 +2099,7 @@ mod tests {
         let path = std::env::temp_dir().join("epc-image-jpeg-named-png.png");
         std::fs::write(
             &path,
-            include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jpeg"),
+            include_bytes!("../../../../resource/images/arc-de-triomphe-paris.jpeg"),
         )
         .unwrap();
 

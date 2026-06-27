@@ -407,7 +407,9 @@ Le hash algorithm attendu pour EPC 1.0 est `sha-256`.
 
 ## Construire un fichier `proof/signature.json`
 
-`SignatureProof` représente une preuve d'authenticité optionnelle.
+`SignatureProof` représente une preuve d'authenticité. Elle est requise par la
+politique SDK pour les manifests `sealed`, et optionnelle pour les états de
+travail `draft` ou de remise `issued`.
 
 ```rust
 use epc_core::{

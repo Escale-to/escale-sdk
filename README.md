@@ -168,11 +168,13 @@ detection.
 
 When using `pack`, `created_at` and `created_local_time` are kept as the
 draft/card creation metadata. Draft manifests use `"status": "draft"` and an
-empty `sealed_at`. By default, `pack` writes `"status": "sealed"` and sets
-`sealed_at` before `proof/hashes.json` and the filename are generated. If
-`sealed_at` is already present, `pack` keeps it unchanged so repeated packs
-produce the same ADR-003 filename. `pack` refuses to overwrite an existing
-`.epc` archive.
+empty `sealed_at`. By default, sealed packing writes `"status": "sealed"` and
+sets `sealed_at` before `proof/hashes.json` and the filename are generated, but
+the validator now requires `proof/signature.json` for sealed manifests. Use
+`pack --sign` for an unsigned draft, or `pack` only when the source already has
+a valid signature proof. If `sealed_at` is already present, `pack` keeps it
+unchanged so repeated packs produce the same ADR-003 filename. `pack` refuses to
+overwrite an existing `.epc` archive.
 
 For cards handed to the Escale travel infrastructure, use `pack --issued`.
 Issued cards use `"status": "issued"`, keep `sealed_at` empty, and are written

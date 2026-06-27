@@ -18,7 +18,7 @@ Le validateur vérifie notamment :
 - `text/message.md` ;
 - les images JXL lorsque la feature `jxl` est active ;
 - `proof/hashes.json` ;
-- `proof/signature.json` si présent.
+- `proof/signature.json`, requis pour un manifest `sealed`.
 
 ## Générer la documentation Rust
 
@@ -82,8 +82,10 @@ proof/hashes.json
 proof/signature.json
 ```
 
-`proof/signature.json` est optionnel. Les autres fichiers sont requis par le
-profil `core-format`.
+`proof/signature.json` est requis pour un manifest `sealed`. Il reste optionnel
+pour les dossiers de travail `draft` et les archives `issued`, dont la
+finalisation appartient à l'infrastructure Escale. Les autres fichiers sont
+requis par le profil `core-format`.
 
 Cette entrée est pratique pour les workflows d'édition, les tests, et le crate
 `epc-pack` avant assemblage ZIP.
@@ -368,9 +370,9 @@ Les champs principaux sont :
 - `signed_at` : date déclarée de signature ;
 - `verified_signatures` : signatures vérifiées avec succès.
 
-Une signature absente n'est pas une erreur, car `proof/signature.json` est
-optionnel dans `core-format`. En revanche, une signature présente mais invalide
-rend l'EPC invalide.
+Une signature absente rend un manifest `sealed` invalide avec le code
+`EPC_SIGNATURE_REQUIRED_FOR_SEALED`. Elle reste acceptée pour les états `draft`
+et `issued`. Une signature présente mais invalide rend l'EPC invalide.
 
 ## Validation ZIP
 
@@ -481,8 +483,8 @@ recalcule `core_digest` avec le domaine `EPC-CORE-V1\n`.
 
 ## Validation des signatures
 
-Si `proof/signature.json` est présent, le validateur vérifie que la signature
-est cohérente avec :
+Pour un manifest `sealed`, `proof/signature.json` doit être présent. Le
+validateur vérifie alors que la signature est cohérente avec :
 
 - l'identifiant du manifest ;
 - la version EPC ;

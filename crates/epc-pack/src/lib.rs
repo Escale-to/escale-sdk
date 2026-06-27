@@ -352,7 +352,10 @@ pub fn sign_core_format_directory(request: SignRequest) -> Result<PathBuf, PackE
     write_manifest(&source_dir, &manifest)?;
     write_hashes(&source_dir)?;
 
-    let report = validate_core_directory(&source_dir);
+    let report = validate_core_directory_with_options(
+        &source_dir,
+        ValidationOptions::default().without_sealed_signature(),
+    );
     if !report.is_valid() {
         return Err(PackError::InvalidSource(report));
     }
@@ -2196,11 +2199,11 @@ fn write_vector_source(root: &Path, card_id: &str, kind: MessageKind) -> Result<
 fn write_sample_jxl_files(root: &Path) -> io::Result<()> {
     fs::write(
         root.join(COVER_PATH),
-        include_bytes!("../../../testcases/images/arc-de-triomphe-paris.jxl"),
+        include_bytes!("../../../../resource/images/arc-de-triomphe-paris.jxl"),
     )?;
     fs::write(
         root.join(THUMBNAIL_PATH),
-        include_bytes!("../../../testcases/images/thumbnail-256.jxl"),
+        include_bytes!("../../../../resource/images/thumbnail-256.jxl"),
     )?;
     Ok(())
 }
@@ -2360,13 +2363,34 @@ mod tests {
         let source = TestDir::new();
         let output = std::env::temp_dir().join("epc-pack-valid.epc");
         let _ = fs::remove_file(&output);
-        write_minimal_source(source.path(), "escale:00000000000000000000000000");
+        write_draft_source(source.path(), "escale:00000000000000000000000000");
+        let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno")).unwrap();
 
         pack_core_format(PackRequest::new(source.path(), &output)).unwrap();
         let report = validate_epc_file(&output);
 
         let _ = fs::remove_file(&output);
         assert!(report.is_valid(), "{report:#?}");
+    }
+
+    #[test]
+    fn refuses_to_pack_unsigned_sealed_source() {
+        let source = TestDir::new();
+        let output = std::env::temp_dir().join("epc-pack-unsigned-sealed.epc");
+        let _ = fs::remove_file(&output);
+        write_minimal_source(source.path(), "escale:00000000000000000000000000");
+
+        let error = pack_core_format(PackRequest::new(source.path(), &output)).unwrap_err();
+
+        let PackError::InvalidSource(report) = error else {
+            panic!("expected invalid source report");
+        };
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "EPC_SIGNATURE_REQUIRED_FOR_SEALED"));
+        assert!(!output.exists());
     }
 
     #[test]
@@ -2477,7 +2501,9 @@ mod tests {
     fn packs_to_adr_003_filename_in_output_directory() {
         let source = TestDir::new();
         let output_dir = TestDir::new();
-        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno")).unwrap();
 
         let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
 
@@ -2490,18 +2516,31 @@ mod tests {
     #[test]
     fn pack_seals_draft_manifest_once_and_reuses_filename() {
         let source = TestDir::new();
+        let key_dir = TestDir::new();
         let first_output_dir = TestDir::new();
         let second_output_dir = TestDir::new();
         write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let key_file = key_dir.path().join("id_ed25519");
+        fs::write(&key_file, openssh_ed25519_private_key([9_u8; 32])).unwrap();
 
-        let first_output =
-            pack_core_format_to_directory(source.path(), first_output_dir.path()).unwrap();
+        let first_output = pack_core_format_to_directory_signed(
+            source.path(),
+            first_output_dir.path(),
+            &key_file,
+            false,
+        )
+        .unwrap();
         let manifest_after_first = read_manifest(source.path());
         assert_eq!(manifest_after_first.status, ManifestStatus::Sealed);
         assert!(!manifest_after_first.sealed_at.is_empty());
 
-        let second_output =
-            pack_core_format_to_directory(source.path(), second_output_dir.path()).unwrap();
+        let second_output = pack_core_format_to_directory_signed(
+            source.path(),
+            second_output_dir.path(),
+            &key_file,
+            false,
+        )
+        .unwrap();
         let manifest_after_second = read_manifest(source.path());
 
         assert_eq!(
@@ -2550,6 +2589,7 @@ mod tests {
     #[test]
     fn pack_completes_missing_generated_manifest_fields() {
         let source = TestDir::new();
+        let key_dir = TestDir::new();
         let output_dir = TestDir::new();
         fs::create_dir_all(source.path().join("media")).unwrap();
         fs::create_dir_all(source.path().join("text")).unwrap();
@@ -2565,8 +2605,16 @@ mod tests {
         .unwrap();
         write_sample_jxl_files(source.path()).unwrap();
         fs::write(source.path().join(MESSAGE_PATH), "Hello **Escale**.\n").unwrap();
+        let key_file = key_dir.path().join("id_ed25519");
+        fs::write(&key_file, openssh_ed25519_private_key([9_u8; 32])).unwrap();
 
-        let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
+        let output = pack_core_format_to_directory_signed(
+            source.path(),
+            output_dir.path(),
+            &key_file,
+            false,
+        )
+        .unwrap();
         let manifest_after_pack = read_manifest(source.path());
 
         assert_eq!(manifest_after_pack.epc_version, epc_core::EPC_VERSION_1_0);
@@ -2590,11 +2638,26 @@ mod tests {
     #[test]
     fn pack_refuses_to_overwrite_existing_archive() {
         let source = TestDir::new();
+        let key_dir = TestDir::new();
         let output_dir = TestDir::new();
         write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let key_file = key_dir.path().join("id_ed25519");
+        fs::write(&key_file, openssh_ed25519_private_key([9_u8; 32])).unwrap();
 
-        let first_output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();
-        let error = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap_err();
+        let first_output = pack_core_format_to_directory_signed(
+            source.path(),
+            output_dir.path(),
+            &key_file,
+            false,
+        )
+        .unwrap();
+        let error = pack_core_format_to_directory_signed(
+            source.path(),
+            output_dir.path(),
+            &key_file,
+            false,
+        )
+        .unwrap_err();
 
         assert!(first_output.exists());
         assert!(matches!(
@@ -2607,7 +2670,9 @@ mod tests {
     fn pack_does_not_rewrite_already_sealed_source_manifest() {
         let source = TestDir::new();
         let output_dir = TestDir::new();
-        write_minimal_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        write_draft_source(source.path(), "escale:00000000000000009X8Q2E5M0A");
+        let seed = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        sign_core_format_directory(SignRequest::new(source.path(), seed, "Bruno")).unwrap();
         let manifest_before = fs::read(source.path().join(MANIFEST_PATH)).unwrap();
 
         let output = pack_core_format_to_directory(source.path(), output_dir.path()).unwrap();

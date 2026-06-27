@@ -34,7 +34,7 @@ Le flux normal de création d'un EPC est :
 2. Copier l'image source acceptée sans modification dans `media/cover.*`.
 3. Dériver `media/thumbnail.jxl` depuis cette couverture avec la règle EPC.
 4. Ajouter ou modifier `text/message.md`.
-5. Signer le dossier si une preuve d'authenticité est souhaitée.
+5. Signer le dossier avant tout scellement final.
 6. Packer le dossier en `.epc`.
 
 La dérivation du thumbnail est fournie par `epc-image` : elle redimensionne la
@@ -194,8 +194,8 @@ Le dossier source doit contenir au minimum :
 - `media/thumbnail.jxl`
 - `text/message.md`
 
-Si `proof/signature.json` existe, il est copié dans le staging et inclus dans
-l'archive.
+Pour produire un staging `sealed`, `proof/signature.json` doit exister et être
+valide. S'il existe, il est copié dans le staging et inclus dans l'archive.
 
 Attention : cette fonction écrit le fichier de sortie avec `create_new`. Elle
 échoue si le fichier `.epc` existe déjà.
@@ -222,9 +222,11 @@ fn main() -> Result<(), epc_pack::PackError> {
 }
 ```
 
-Cette fonction met le manifest en statut `sealed` si nécessaire. Si `sealed_at`
-est vide, le timestamp scellé est écrit dans le `manifest.json` du dossier
-source, puis utilisé pour calculer le nom final.
+Cette fonction met le manifest en statut `sealed` si nécessaire, mais le
+validateur refuse le résultat si aucune signature valide n'est présente. Pour un
+brouillon non signé, utiliser `pack_core_format_to_directory_signed`. Si
+`sealed_at` est vide, le timestamp scellé est écrit dans le `manifest.json` du
+dossier source, puis utilisé pour calculer le nom final.
 
 Le nom généré suit la forme :
 
@@ -235,8 +237,8 @@ Le nom généré suit la forme :
 `TIME6` est dérivé de `sealed_at`. `ID10` correspond aux 10 derniers caractères
 de l'identifiant EPC.
 
-Si le manifest est déjà scellé, son `sealed_at` existant est conservé. Cela
-permet de repacker le même contenu avec un nom stable.
+Si le manifest est déjà scellé et signé, son `sealed_at` existant est conservé.
+Cela permet de repacker le même contenu avec un nom stable.
 
 Pour préparer une carte destinée à l'infrastructure de voyage, utiliser
 `pack_core_format_to_directory_issued`. Le manifest passe alors en statut
@@ -443,10 +445,10 @@ Pour obtenir un nom de fichier temporaire basé sur l'identifiant, utiliser
 `draft_filename_from_directory`.
 
 Pour packer vers un fichier précis, utiliser `pack_core_format` avec
-`PackRequest`.
+`PackRequest`. Un packing `sealed` exige une signature valide.
 
-Pour packer vers un dossier avec nom canonique scellé, utiliser
-`pack_core_format_to_directory`.
+Pour packer vers un dossier avec nom canonique scellé depuis une source déjà
+signée, utiliser `pack_core_format_to_directory`.
 
 Pour produire une archive `issued` destinée à l'infrastructure de voyage,
 utiliser `pack_core_format_to_directory_issued` ou `PackRequest::with_mode` avec
@@ -457,7 +459,7 @@ Pour signer avec un seed Base64URL, utiliser `sign_core_format_directory`.
 Pour signer avec une clé OpenSSH Ed25519 non chiffrée, utiliser
 `sign_core_format_directory_with_ssh_key`.
 
-Pour signer puis packer dans un seul appel, utiliser
+Pour signer puis packer un brouillon dans un seul appel, utiliser
 `pack_core_format_to_directory_signed`.
 
 Pour générer les archives de conformité, utiliser

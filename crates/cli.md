@@ -156,9 +156,13 @@ Par défaut, la commande :
 
 1. met le manifest en statut `sealed` et renseigne `sealed_at` si nécessaire ;
 2. régénère `proof/hashes.json` ;
-3. valide le dossier staging ;
+3. valide le dossier staging, y compris la présence d'une signature pour
+   `sealed` ;
 4. écrit l'archive `.epc` avec un nom canonique ;
 5. affiche le chemin du fichier généré sur `stdout`.
+
+Une source non signée ne peut donc pas produire une archive `sealed`. Pour
+signer et packer un brouillon en une seule commande, utiliser `pack --sign`.
 
 Le nom final suit la forme :
 
